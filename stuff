@@ -1,336 +1,45 @@
-print("hello world")
-
 import pandas as pd
-import dask.dataframe as dd
-import vaex
 import numpy as np
-import pyarrow as pa
-import modin.pandas as mpd
-from pathlib import Path
 
-def optimize_pandas_df(df):
+def calc_distribution_averages(df1, df2, n_buckets=10):
     """
-    Optimize pandas DataFrame memory usage by downcasting numeric columns
-    and categorizing string columns with low cardinality.
-    """
-    for col in df.columns:
-        # Downcast numeric columns
-        if pd.api.types.is_numeric_dtype(df[col]):
-            if pd.api.types.is_integer_dtype(df[col]):
-                df[col] = pd.to_numeric(df[col], downcast='integer')
-            else:
-                df[col] = pd.to_numeric(df[col], downcast='float')
-        # Convert string columns with low cardinality to categorical
-        elif pd.api.types.is_string_dtype(df[col]):
-            num_unique = df[col].nunique()
-            if num_unique / len(df) < 0.1:  # If less than 10% unique values
-                df[col] = df[col].astype('category')
-    return df
-
-def process_large_data_pandas(df1_path, df2_path, filter_conditions):
-    """
-    Process large DataFrames using chunked reading with pandas
-    """
-    chunk_size = 1_000_000
-    reader1 = pd.read_csv(df1_path, chunksize=chunk_size)
-    reader2 = pd.read_csv(df2_path, chunksize=chunk_size)
-    
-    # Process chunks and concatenate results
-    results = []
-    for chunk1, chunk2 in zip(reader1, reader2):
-        # Optimize memory usage
-        chunk1 = optimize_pandas_df(chunk1)
-        chunk2 = optimize_pandas_df(chunk2)
-        
-        # Merge chunks
-        merged = pd.merge(chunk1, chunk2, on='key_column')
-        
-        # Apply filters
-        for condition in filter_conditions:
-            merged = merged.query(condition)
-            
-        results.append(merged)
-    
-    return pd.concat(results)
-
-def process_large_data_dask(df1_path, df2_path, filter_conditions):
-    """
-    Process large DataFrames using Dask
-    """
-    # Read data with Dask
-    df1 = dd.read_csv(df1_path)
-    df2 = dd.read_csv(df2_path)
-    
-    # Merge DataFrames
-    merged = dd.merge(df1, df2, on='key_column')
-    
-    # Apply filters
-    for condition in filter_conditions:
-        merged = merged.query(condition)
-    
-    return merged.compute()
-
-def process_large_data_vaex(df1_path, df2_path, filter_conditions):
-    """
-    Process large DataFrames using Vaex
-    """
-    # Convert CSV to HDF5 format for better performance
-    df1_hdf = f"{Path(df1_path).stem}.hdf5"
-    df2_hdf = f"{Path(df2_path).stem}.hdf5"
-    
-    # Read data with Vaex
-    df1 = vaex.from_csv(df1_path, convert=True, chunk_size=1_000_000)
-    df2 = vaex.from_csv(df2_path, convert=True, chunk_size=1_000_000)
-    
-    # Merge DataFrames
-    merged = df1.join(df2, on='key_column')
-    
-    # Apply filters
-    for condition in filter_conditions:
-        merged = merged.filter(condition)
-    
-    return merged
-
-def process_large_data_arrow(df1_path, df2_path, filter_conditions):
-    """
-    Process large DataFrames using PyArrow
-    """
-    # Read data with PyArrow
-    table1 = pa.csv.read_csv(df1_path)
-    table2 = pa.csv.read_csv(df2_path)
-    
-    # Convert to pandas for merge operation
-    df1 = table1.to_pandas()
-    df2 = table2.to_pandas()
-    
-    # Optimize memory usage
-    df1 = optimize_pandas_df(df1)
-    df2 = optimize_pandas_df(df2)
-    
-    # Merge DataFrames
-    merged = pd.merge(df1, df2, on='key_column')
-    
-    # Apply filters
-    for condition in filter_conditions:
-        merged = merged.query(condition)
-    
-    return merged
-
-def benchmark_processing_methods(df1_path, df2_path, filter_conditions):
-    """
-    Benchmark different processing methods
-    """
-    import time
-    results = {}
-    
-    methods = {
-        'pandas_chunked': process_large_data_pandas,
-        'dask': process_large_data_dask,
-        'vaex': process_large_data_vaex,
-        'pyarrow': process_large_data_arrow
-    }
-    
-    for name, method in methods.items():
-        start_time = time.time()
-        try:
-            result = method(df1_path, df2_path, filter_conditions)
-            end_time = time.time()
-            results[name] = {
-                'success': True,
-                'time': end_time - start_time,
-                'result_size': len(result) if hasattr(result, '__len__') else 'N/A'
-            }
-        except Exception as e:
-            results[name] = {
-                'success': False,
-                'error': str(e)
-            }
-    
-    return results
-
-import pandas as pd
-import pyarrow as pa
-import polars as pl
-import numpy as np
-import time
-from typing import Tuple
-import psutil
-import gc
-
-def get_memory_usage():
-    """Return current memory usage in GB"""
-    process = psutil.Process()
-    memory_gb = process.memory_info().rss / (1024 * 1024 * 1024)
-    return memory_gb
-
-class MergeBenchmark:
-    def __init__(self, df1: pd.DataFrame, df2: pd.DataFrame, on_column: str):
-        """
-        Initialize benchmark with two pandas DataFrames and the join column
-        
-        Parameters:
-        -----------
-        df1, df2 : pd.DataFrame
-            Input DataFrames to merge
-        on_column : str
-            Column name to join on
-        """
-        self.df1 = df1
-        self.df2 = df2
-        self.on_column = on_column
-        self.results = {}
-
-    def _measure_operation(self, operation_name: str, func) -> dict:
-        """Measure execution time and memory usage of an operation"""
-        gc.collect()  # Clear memory before test
-        initial_memory = get_memory_usage()
-        
-        start_time = time.perf_counter()
-        try:
-            result = func()
-            success = True
-            error = None
-        except Exception as e:
-            result = None
-            success = False
-            error = str(e)
-        
-        end_time = time.perf_counter()
-        peak_memory = get_memory_usage()
-        
-        metrics = {
-            'execution_time': end_time - start_time,
-            'initial_memory_gb': initial_memory,
-            'peak_memory_gb': peak_memory,
-            'memory_increase_gb': peak_memory - initial_memory,
-            'success': success,
-            'error': error
-        }
-        
-        if success:
-            metrics['result_shape'] = result.shape if hasattr(result, 'shape') else None
-        
-        return metrics
-
-    def pandas_merge(self) -> dict:
-        """Benchmark pandas merge"""
-        def merge_operation():
-            return pd.merge(self.df1, self.df2, on=self.on_column)
-        
-        return self._measure_operation('pandas', merge_operation)
-
-    def pyarrow_merge(self) -> dict:
-        """Benchmark PyArrow merge"""
-        def merge_operation():
-            # Convert pandas DataFrames to PyArrow tables
-            table1 = pa.Table.from_pandas(self.df1)
-            table2 = pa.Table.from_pandas(self.df2)
-            
-            # Perform join using PyArrow compute functions
-            joined = table1.join(table2, keys=self.on_column)
-            
-            # Convert back to pandas for consistent output
-            return joined.to_pandas()
-        
-        return self._measure_operation('pyarrow', merge_operation)
-
-    def polars_merge(self) -> dict:
-        """Benchmark Polars merge"""
-        def merge_operation():
-            # Convert pandas DataFrames to Polars
-            pl1 = pl.from_pandas(self.df1)
-            pl2 = pl.from_pandas(self.df2)
-            
-            # Perform join using Polars
-            joined = pl1.join(pl2, on=self.on_column)
-            
-            # Convert back to pandas for consistent output
-            return joined.to_pandas()
-        
-        return self._measure_operation('polars', merge_operation)
-
-    def run_all_benchmarks(self) -> dict:
-        """Run all benchmark tests"""
-        print("Starting benchmarks...")
-        
-        self.results['pandas'] = self.pandas_merge()
-        print("Pandas merge completed")
-        
-        self.results['pyarrow'] = self.pyarrow_merge()
-        print("PyArrow merge completed")
-        
-        self.results['polars'] = self.polars_merge()
-        print("Polars merge completed")
-        
-        return self.results
-
-    def print_results(self):
-        """Print formatted benchmark results"""
-        if not self.results:
-            print("No benchmark results available. Run benchmarks first.")
-            return
-
-        print("\nBenchmark Results:")
-        print("=" * 80)
-        
-        headers = ['Method', 'Time (s)', 'Memory Increase (GB)', 'Success', 'Error']
-        print(f"{headers[0]:<10} {headers[1]:<12} {headers[2]:<20} {headers[3]:<10} {headers[4]:<20}")
-        print("-" * 80)
-        
-        for method, metrics in self.results.items():
-            print(
-                f"{method:<10} "
-                f"{metrics['execution_time']:<12.2f} "
-                f"{metrics['memory_increase_gb']:<20.2f} "
-                f"{str(metrics['success']):<10} "
-                f"{str(metrics['error'] or ''):<20}"
-            )
-
-# Example usage and helper function to create test data
-def create_test_dataframes(
-    rows1: int = 1_000_000,
-    rows2: int = 1_000_000,
-    join_cardinality: float = 0.7
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Create test DataFrames with specified characteristics
+    Calculate average values of df2 across the distribution of df1,
+    using fully vectorized operations for maximum performance.
     
     Parameters:
-    -----------
-    rows1, rows2 : int
-        Number of rows in each DataFrame
-    join_cardinality : float
-        Proportion of unique values in the join column (0-1)
+    df1, df2: pandas DataFrames with same shape
+    n_buckets: number of buckets to create
+    
+    Returns:
+    DataFrame with buckets as index and average values as columns
     """
-    # Calculate number of unique values for join column
-    n_unique = int(min(rows1, rows2) * join_cardinality)
+    # Calculate quantile boundaries across all values
+    all_values = df1.values.ravel()
+    boundaries = np.percentile(all_values, 
+                             np.linspace(0, 100, n_buckets + 1),
+                             method='linear')
     
-    # Create first DataFrame
-    df1 = pd.DataFrame({
-        'id': np.random.randint(0, n_unique, rows1),
-        'value1': np.random.rand(rows1),
-        'category1': np.random.choice(['A', 'B', 'C'], rows1)
-    })
+    # Vectorized bucket assignment for entire DataFrame
+    bucket_indices = np.digitize(df1.values, boundaries[1:-1])
     
-    # Create second DataFrame
-    df2 = pd.DataFrame({
-        'id': np.random.randint(0, n_unique, rows2),
-        'value2': np.random.rand(rows2),
-        'category2': np.random.choice(['X', 'Y', 'Z'], rows2)
-    })
+    # Create a DataFrame of bucket assignments
+    buckets_df = pd.DataFrame(bucket_indices, 
+                             index=df1.index,
+                             columns=df1.columns)
     
-    return df1, df2
-
-# Example usage:
-if __name__ == "__main__":
-    # Create test data
-    df1, df2 = create_test_dataframes(
-        rows1=1_000_000,
-        rows2=1_000_000,
-        join_cardinality=0.7
-    )
+    # Stack both DataFrames to long format for vectorized groupby
+    stacked_buckets = buckets_df.stack()
+    stacked_values = df2.stack()
     
-    # Initialize and run benchmarks
-    benchmark = MergeBenchmark(df1, df2, 'id')
-    results = benchmark.run_all_benchmarks()
-    benchmark.print_results()
+    # Perform groupby operation once for all columns
+    result = (pd.DataFrame({'bucket': stacked_buckets, 'value': stacked_values})
+             .groupby(['bucket'])['value']
+             .mean()
+             .reset_index())
+    
+    # Reshape back to original format
+    result = (result.pivot(columns='bucket', values='value')
+             .rename(columns={i: f'Q{i+1}' for i in range(n_buckets)})
+             .T)
+    
+    return result

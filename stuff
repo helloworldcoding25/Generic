@@ -43,3 +43,103 @@ def calc_distribution_averages(df1, df2, n_buckets=10):
              .T)
     
     return result
+
+import pandas as pd
+import numpy as np
+
+def process_group(df_group):
+    """
+    Process a single ISIN group (already sorted by time) and simulate the sequential
+    impact of candidate trades. Returns extra columns:
+      - risk_reducing: bool indicating if that trade would have reduced risk
+      - candidate_effect: using the 'size' column (which equals posPost - posPre)
+      - simulated_start_before: simulation state (starting position) before the trade
+      - simulated_final_after: simulation state (final position) after the trade if applied
+      - abs_improvement: improvement in |position| from applying this trade
+    """
+    # Sort by time.
+    df_group = df_group.sort_values('time').copy()
+    n = len(df_group)
+    
+    # Extract arrays for speed.
+    times = df_group['time'].values
+    posPre_arr = df_group['posPre'].values
+    posPost_arr = df_group['posPost'].values
+    doneStatus_arr = df_group['status'].values
+    size_arr = df_group['size'].values  # Using the provided size column directly
+
+    # Use size as the candidate effect.
+    cand_effect = size_arr.copy()
+
+    # Allocate output arrays.
+    risk_reducing = np.zeros(n, dtype=bool)
+    simulated_start_before = np.empty(n, dtype=posPre_arr.dtype)
+    simulated_final_after = np.empty(n, dtype=posPre_arr.dtype)
+    abs_improvement = np.zeros(n, dtype=posPre_arr.dtype)
+    
+    # Determine the baseline simulation state.
+    # Look for the last DONE trade.
+    final_trade_index = None
+    for i in range(n):
+        if doneStatus_arr[i] == 'DONE':
+            final_trade_index = i  # will update to the last DONE trade index
+
+    if final_trade_index is not None:
+        # For a DONE trade, use its posPre as the baseline start,
+        # and use its posPost directly as the baseline final.
+        fixed_effect = posPost_arr[final_trade_index] - posPre_arr[final_trade_index]
+        baseline_start = posPre_arr[final_trade_index]
+        baseline_final = posPost_arr[final_trade_index]
+    else:
+        fixed_effect = 0.0
+        baseline_start = posPre_arr[0]
+        baseline_final = baseline_start
+
+    # Initialize simulation state.
+    current_start = baseline_start
+    current_final = baseline_final
+
+    # Process each row sequentially.
+    for i in range(n):
+        simulated_start_before[i] = current_start
+        # In the DONE-case, only simulate for trades before the final DONE trade.
+        if (final_trade_index is not None) and (i >= final_trade_index):
+            # For trades at or after the final DONE trade, we do not simulate.
+            simulated_final_after[i] = current_final
+            abs_improvement[i] = 0.0
+            risk_reducing[i] = False
+        else:
+            new_start = current_start + cand_effect[i]
+            # In the DONE-case, the final position is updated by adding the fixed effect.
+            # In the no-DONE-case, fixed_effect is 0.
+            new_final = new_start + fixed_effect
+            improvement = abs(current_final) - abs(new_final)
+            if improvement > 0:
+                risk_reducing[i] = True
+                # Update the simulation state.
+                current_start = new_start
+                current_final = new_final
+                abs_improvement[i] = improvement
+            else:
+                risk_reducing[i] = False
+                abs_improvement[i] = 0.0
+            simulated_final_after[i] = current_final
+
+    # Attach the computed arrays as new columns.
+    df_group['risk_reducing'] = risk_reducing
+    df_group['candidate_effect'] = cand_effect
+    df_group['simulated_start_before'] = simulated_start_before
+    df_group['simulated_final_after'] = simulated_final_after
+    df_group['abs_improvement'] = abs_improvement
+
+    return df_group
+
+def add_risk_reducing_info(df):
+    """
+    Process the entire dataframe by ISIN and return the dataframe with additional
+    columns that indicate for each row if that trade would have been risk reducing and
+    how that conclusion was reached.
+    """
+    # Process by ISIN groups.
+    df_with_info = df.groupby('isin', group_keys=False).apply(process_group)
+    return df_with_info

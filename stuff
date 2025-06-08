@@ -143,3 +143,43 @@ def add_risk_reducing_info(df):
     # Process by ISIN groups.
     df_with_info = df.groupby('isin', group_keys=False).apply(process_group)
     return df_with_info
+
+import numpy as np
+
+def cross_sectional_ridge(eps_hat: np.ndarray,
+                          beta:    np.ndarray,
+                          lam:     float | None = None,
+                          return_gross: bool = True):
+    """
+    Cross-sectional ridge solve:
+        argmin_F  || eps_hat + beta @ F ||^2 + lam * ||F||^2
+
+    Parameters
+    ----------
+    eps_hat : (N,)  idiosyncratic %-return predictions
+    beta    : (N, L) factor-loading matrix
+    lam     : ridge penalty; default = 1e-4 * N   (good first guess)
+    return_gross : also return eps_hat + beta @ F_hat if True
+
+    Returns
+    -------
+    F_hat : (L,)  inferred factor % returns
+    gross_pred  (optional) : (N,) gross % forecast per bond
+    """
+    eps_hat = np.asarray(eps_hat, dtype=float)
+    beta    = np.asarray(beta,    dtype=float)
+    N, L    = beta.shape
+
+    # sensible default for lambda
+    if lam is None:
+        lam = 1e-4 * N
+
+    A = beta.T @ beta + lam * np.eye(L)       # (L,L)
+    b = -beta.T @ eps_hat                     # (L,)
+
+    F_hat = np.linalg.solve(A, b)             # (L,)
+
+    if return_gross:
+        gross_pred = eps_hat + beta @ F_hat   # (N,)
+        return F_hat, gross_pred
+    return F_hat

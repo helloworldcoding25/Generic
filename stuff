@@ -36,6 +36,28 @@ def cross_sectional_ridge(eps_hat: np.ndarray,
         return F_hat, gross_pred
     return F_hat
 
+# --- inputs -----------------------------------------------------------
+eps_hat = np.array([0.0040, 0.0035, 0.0001, -0.0002])   # % changes
+
+beta = np.array([[1, 1, 0],     # bond A
+                 [1, 1, 0],     # bond B
+                 [1, 0, 1],     # bond C
+                 [1, 0, 1]])    # bond D
+
+lam = 0.004          # λ = 0.001 * N  (N = 4)
+
+# --- solve ------------------------------------------------------------
+F_hat, gross = cross_sectional_ridge(eps_hat, beta, lam)
+
+print("Factor returns (10-day %):")
+print(f"  Market   : {F_hat[0]: .6%}")
+print(f"  Energy   : {F_hat[1]: .6%}")
+print(f"  Utilities: {F_hat[2]: .6%}")
+
+print("\nBond-level gross % forecast:")
+for i, g in enumerate(gross, 1):
+    print(f"  Bond {i}: {g: .6%}")
+
 
 import pandas as pd
 import numpy as np

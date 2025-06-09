@@ -1,3 +1,86 @@
+import pandas as pd
+import numpy as np
+
+# --- assume you already have these three daily Series -------------
+# idx = DatetimeIndex of trade dates
+# each Series is length T (= # days) with NaN where data not available
+eps_hat    = ...   # idiosyncratic % forecast, index = dates
+sys_hat    = ...   # systematic  % forecast, index = dates
+gross_real = ...   # realised     % move,   index = dates
+
+# --- put them in one DataFrame for convenience -------------------
+df = pd.DataFrame({
+        'y':   gross_real,
+        'x1':  eps_hat,
+        'x2':  sys_hat
+     }).dropna()
+
+window = 504                       # ~ 2 years of trading days
+coeffs = pd.DataFrame(index=df.index, columns=['gamma1','gamma2'])
+
+# --- rolling OLS ---------------------------------------------------
+for end in range(window, len(df)):
+    slice_ = df.iloc[end-window:end]
+    X = slice_[['x1','x2']].values
+    y = slice_['y'].values
+    # add no intercept → y = gamma1*x1 + gamma2*x2
+    gamma, *_ = np.linalg.lstsq(X, y, rcond=None)
+    coeffs.iloc[end] = gamma      # store (gamma1, gamma2)
+
+# forward-fill the earlier rows so we have coeffs for every date
+coeffs = coeffs.ffill()
+
+# --- apply calibrated forecast ------------------------------------
+df['y_cal'] = coeffs['gamma1']*df['x1'] + coeffs['gamma2']*df['x2']
+
+# --- sanity check: rolling rank IC --------------------------------
+ic_raw = df['y'].rolling(126).corr(df['x1']+df['x2'])     # ~6-mo window
+ic_cal = df['y'].rolling(126).corr(df['y_cal'])
+print('Average IC raw :', ic_raw.mean())
+print('Average IC cal :', ic_cal.mean())
+
+
+import pandas as pd
+from scipy.stats import spearmanr
+import numpy as np
+
+# idio_pred and idio_real are DataFrames: index = dates, columns = bonds
+def daily_rank_ic(idio_pred, idio_real):
+    out = []
+    for date in idio_pred.index:
+        f = idio_pred.loc[date].values      # forecasts
+        r = idio_real.loc[date].values      # realised idio returns
+        mask = ~np.isnan(f) & ~np.isnan(r)
+        if mask.sum() > 3:                  # need at least 4 names
+            ic = spearmanr(f[mask], r[mask]).correlation
+            out.append(ic)
+        else:
+            out.append(np.nan)
+    return pd.Series(out, index=idio_pred.index)
+
+rank_ic = daily_rank_ic(idio_pred, idio_real)
+print("Average daily Rank IC:", rank_ic.mean())
+
+
+# eps_hat  = N×T matrix of idio forecasts
+# gross_hat= eps_hat + beta @ F_hat    (systematic added)
+# realised_epsilon = realised_idio_ret
+# realised_gross   = realised_raw_ret_pct
+
+from scipy.stats import spearmanr
+
+def rank_ic(forecast, realised):
+    ic = [spearmanr(forecast[:,t], realised[:,t]).correlation
+          for t in range(forecast.shape[1])]
+    return np.nanmean(ic)
+
+ic_eps_vs_eps   = rank_ic(eps_hat, realised_epsilon)
+ic_eps_vs_gross = rank_ic(eps_hat, realised_gross)
+ic_full_vs_gross= rank_ic(gross_hat, realised_gross)
+
+print(ic_eps_vs_eps, ic_eps_vs_gross, ic_full_vs_gross)
+
+
 def cross_sectional_ridge(eps_hat: np.ndarray,
                           beta:    np.ndarray,
                           lam:     float | None = None,

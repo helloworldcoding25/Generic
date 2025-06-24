@@ -16,6 +16,7 @@ from sklearn.metrics import (
     mean_absolute_error,
     r2_score,
 )
+from sklearn.model_selection import TimeSeriesSplit
 
 plt.switch_backend("agg")       # comment-out if running interactively
 
@@ -204,11 +205,13 @@ def trainRidgeGeneric(
         maskTrain, maskTest = makeDateMasks(dfFeat, split)
 
         # sklearn Pipeline: standardise → ridge with CV over 'alphas'
+        # Create a time-aware CV splitter
+        tscv = TimeSeriesSplit(n_splits=3)
         model = Pipeline([
             ("scaler", StandardScaler()),
             ("ridge", RidgeCV(alphas=alphas,
                               scoring="neg_mean_squared_error",
-                              cv=3)),
+                              cv=tscv)),
         ]).fit(XAll[maskTrain], yAll[maskTrain])
 
         # Predictions

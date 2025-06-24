@@ -205,7 +205,7 @@ def trainRidgeGeneric(
         maskTrain, maskTest = makeDateMasks(dfFeat, split)
 
         # sklearn Pipeline: standardise → ridge with CV over 'alphas'
-        # Create a time-aware CV splitter
+        # Create a time-aware CV splitter. Ensure data is sorted by time
         tscv = TimeSeriesSplit(n_splits=3)
         model = Pipeline([
             ("scaler", StandardScaler()),

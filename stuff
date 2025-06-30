@@ -1,3 +1,29 @@
+import numpy as np
+
+def scaled_sigma(z, p, sigma0, z_ref=3.0, alpha=0.8, beta=0.6):
+    """
+    z       : ndarray   # vol-adj return, <0 tighten, >0 widen
+    p       : ndarray   # prob(tighten)
+    sigma0  : ndarray   # baseline σ (bp)
+    z_ref   : float     # cap |z| at z_ref for strength calc
+    alpha   : float     # boost factor on agreement
+    beta    : float     # shrink factor on disagreement
+    """
+    sign_z   = np.sign(z)
+    sign_p   = np.where(p > 0.5, -1.0, 1.0)
+
+    A = 0.5 * (1 + sign_z * sign_p)            # 1 agree, 0 disagree
+    C = 2.0 * np.abs(p - 0.5)                  # confidence
+    S = np.minimum(1.0, np.abs(z) / z_ref)     # regressor strength
+
+    scale = 1 + alpha * A * C * S - beta * (1 - A) * C
+    return sigma0 * scale
+
+
+def gross_return(z, p, sigma0, **kw):
+    sig = scaled_sigma(z, p, sigma0, **kw)
+    return np.sign(z) * np.abs(z) * sig
+
 # ================================================================
 # 0.  Imports & basic config
 # ================================================================

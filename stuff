@@ -1,3 +1,87 @@
+# RV 
+import pandas as pd
+import numpy as np
+
+def _one_hot(df: pd.DataFrame, cols: list[str]) -> tuple[np.ndarray, list[str]]:
+    """
+    Memory‑efficient one‑hot for small (< ~few hundred) cross‑sectional universes.
+    Returns design matrix X (n×k) without the intercept (added later).
+    """
+    mats, names = [], []
+    for c in cols:
+        codes, uniques = pd.factorize(df[c], sort=True)
+        k = uniques.size
+        # sparse one‑hot via compare‑broadcast (faster than get_dummies for small n)
+        mats.append((codes[:, None] == np.arange(k)).astype(float))
+        names.extend([f'{c}={u}' for u in uniques])
+    return np.hstack(mats), names
+
+def _cross_sectional_fit(y: np.ndarray, X: np.ndarray) -> np.ndarray:
+    """OLS β = (X'X)⁻¹ X'y solved via least‑squares; returns fitted values."""
+    # prepend intercept
+    Xint = np.hstack((np.ones((X.shape[0], 1)), X))
+    coeff, *_ = np.linalg.lstsq(Xint, y, rcond=None)
+    return Xint @ coeff  # ŷ
+
+def compute_relative_value_lr(
+    df: pd.DataFrame,
+    bias_lookback: int = 720,
+    shock_lookback: int = 24,
+    shock_vol_lookback: int = 168,
+    shock_thresh: float = 4.0,
+) -> pd.Series:
+    """
+    Adds a fast cross‑sectional linear regression each hour to isolate 'fair' spread.
+    """
+    # ----------  housekeeping  ----------
+    keys = df.index.str.rsplit('|', n=1, expand=True)
+    df = df.assign(isin=keys[0].values,
+                   dt=pd.to_datetime(keys[1].values))
+    df = df.set_index(['dt', 'isin']).sort_index()
+
+    # pre‑compute numeric liquidity feature
+    df['log_amt'] = np.log1p(df['curamount'])
+
+    # ----------  1) Cross‑sectional regression each hour  ----------
+    # groupby‑apply keeps the loop in C; each sub‑df is tiny (cross‑section of 100‑400 bonds)
+    def _fit_hour(hour_df: pd.DataFrame) -> pd.Series:
+        Xcat, _ = _one_hot(hour_df, ['ticker', 'sector', 'tenor', 'seniority'])
+        X = np.hstack((Xcat, hour_df[['log_amt']].values))
+        y_hat = _cross_sectional_fit(hour_df['mid'].values, X)
+        return pd.Series(y_hat, index=hour_df.index.get_level_values('isin'), name='fitted')
+
+    fitted = df.groupby('dt', group_keys=False).apply(_fit_hour)
+    df = df.join(fitted)
+
+    resid = df['mid'] - df['fitted']          # cheap/rich vs. linear model
+
+    # ----------  2) De‑bias persistent issuer effects  ----------
+    bias = (resid.groupby(level='isin')
+                  .rolling(bias_lookback, min_periods=bias_lookback//2)
+                  .mean()
+                  .droplevel(0))
+    adj_resid = resid - bias
+
+    # ----------  3) Shock / credit‑event suppression  ----------
+    spread_change = (df['mid'] -
+                     df.groupby(level='isin')['mid'].shift(shock_lookback)).abs()
+    roll_sigma = (df.groupby(level='isin')['mid']
+                    .rolling(shock_vol_lookback, min_periods=shock_vol_lookback//2)
+                    .std()
+                    .droplevel(0)
+                    .replace(0, np.nan))
+    shock_flag = (spread_change > shock_thresh * roll_sigma)
+
+    # ----------  4) Final RV score (z‑score of adj_resid) ----------
+    cohort_cols = ['sector', 'tenor', 'seniority']
+    cohort_std = df.groupby(['dt'] + cohort_cols)['mid'].transform('std').fillna(1.0)
+    rv = (adj_resid / cohort_std).where(~shock_flag, 0.0)
+    rv.name = 'rv_score'
+    return rv
+
+
+-------------------------------------
+
 import numpy as np
 
 def scaled_sigma(z, p, sigma0, z_ref=3.0, alpha=0.8, beta=0.6):

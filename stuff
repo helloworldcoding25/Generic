@@ -79,6 +79,106 @@ def compute_relative_value_lr(
     rv.name = 'rv_score'
     return rv
 
+------------------------------------
+
+# RV SPARSE / FAST
+
+import pandas as pd
+import numpy as np
+from scipy import sparse
+from sklearn.feature_extraction import FeatureHasher
+from sklearn.linear_model import Ridge
+
+# ----------  helpers  ----------
+_hasher = FeatureHasher(n_features=512, input_type='string')  # 512 hashed bins for ticker
+
+def _sparse_one_hot(df: pd.DataFrame, cols: list[str]) -> sparse.csr_matrix:
+    """Dense small‑cardinality dummies → sparse CSR."""
+    mats = []
+    for c in cols:
+        codes, _ = pd.factorize(df[c], sort=True)
+        n = codes.max() + 1
+        row = np.arange(len(df))
+        mats.append(sparse.csr_matrix(
+            (np.ones_like(codes, dtype=float), (row, codes)),
+            shape=(len(df), n)
+        ))
+    return sparse.hstack(mats, format='csr')
+
+def _fit_hour_fast(hour_df: pd.DataFrame) -> pd.Series:
+    """
+    Build a sparse design matrix:
+        [ one‑hot(sector, tenor, seniority) | hash(ticker) | log(curamount) ]
+    and solve ridge → fitted spread.
+    """
+    # small‑cardinality dummies
+    X_base = _sparse_one_hot(hour_df, ['sector', 'tenor', 'seniority'])
+
+    # hashed ticker features (already sparse CSR)
+    X_tick = _hasher.transform(hour_df['ticker'])
+
+    # numeric liquidity column
+    X_liq  = sparse.csr_matrix(hour_df[['log_amt']].values)
+
+    X = sparse.hstack([X_base, X_tick, X_liq], format='csr')
+
+    y = hour_df['mid'].values
+    model = Ridge(alpha=1e‑3, fit_intercept=True, solver='sag', max_iter=100, tol=1e‑3)
+    y_hat = model.fit(X, y).predict(X)
+
+    return pd.Series(y_hat, index=hour_df.index.get_level_values('isin'), name='fitted')
+
+# ----------  main pipeline  ----------
+def compute_relative_value_large(
+    df: pd.DataFrame,
+    bias_lookback: int = 720,
+    shock_lookback: int = 24,
+    shock_vol_lookback: int = 168,
+    shock_thresh: float = 4.0,
+) -> pd.Series:
+    """
+    Relative‑value score identical to previous version,
+    but cross‑sectional fair value is estimated with a sparse hashed‑feature ridge
+    => scales to 10 k+ bonds per hour.
+    """
+    keys = df.index.str.rsplit('|', n=1, expand=True)
+    df = df.assign(isin=keys[0].values,
+                   dt=pd.to_datetime(keys[1].values),
+                   ticker=keys[0].str[:6])          # e.g. first part of ISIN as ticker
+    df = df.set_index(['dt', 'isin']).sort_index()
+    df['log_amt'] = np.log1p(df['curamount'])
+
+    # 1) cross‑sectional fit (parallelisable if desired)
+    fitted = df.groupby('dt', group_keys=False).apply(_fit_hour_fast)
+    df = df.join(fitted)
+
+    resid = df['mid'] - df['fitted']
+
+    # 2) issuer bias removal
+    bias = (resid.groupby(level='isin')
+                  .rolling(bias_lookback, min_periods=bias_lookback//2)
+                  .mean()
+                  .droplevel(0))
+    adj_resid = resid - bias
+
+    # 3) credit‑event suppression
+    spread_change = (df['mid'] -
+                     df.groupby(level='isin')['mid'].shift(shock_lookback)).abs()
+    roll_sigma = (df.groupby(level='isin')['mid']
+                    .rolling(shock_vol_lookback, min_periods=shock_vol_lookback//2)
+                    .std()
+                    .droplevel(0)
+                    .replace(0, np.nan))
+    shock_flag = (spread_change > shock_thresh * roll_sigma)
+
+    # 4) z‑score within cohort & output
+    cohort_std = df.groupby(['dt', 'sector', 'tenor', 'seniority'])['mid'] \
+                   .transform('std').fillna(1.0)
+
+    rv = (adj_resid / cohort_std).where(~shock_flag, 0.0)
+    rv.name = 'rv_score'
+    return rv
+
 
 -------------------------------------
 

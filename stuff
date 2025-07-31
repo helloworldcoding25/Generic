@@ -1,3 +1,86 @@
+"""
+Skew helper for corporate-bond RFQs.
+
+Inputs
+------
+idio_pred_bp : float
+    Model-predicted *EOD idiosyncratic* spread move in bp.
+    > 0  → expected widening
+    < 0  → expected tightening
+side        : "buy" | "sell"
+    From the client’s perspective (client buys → dealer sells).
+mid_spread  : float
+    Mid-market spread of the bond (bp).
+cfg         : SkewConfig
+    Tuning parameters (linear slope, asymmetry tables, hard cap).
+
+Returns
+-------
+quoted_spread : float
+    Mid spread + skew (bp).
+skew_bp       : float
+    The skew that was applied (bp) – useful for logging / ML features.
+"""
+from dataclasses import dataclass, field
+from math import copysign, tanh
+
+@dataclass
+class SkewConfig:
+    # --- core scale settings -------------------------------------------------
+    base_slope: float = 0.6        # bp of skew per 1 bp of predicted move
+    max_skew:  float = 8.0         # hard cap in either direction (bp)
+    # --- optional non-linear damping (helps with outliers) -------------------
+    non_linear: bool   = True
+    nn_width:   float  = 6.0       # inflection width for tanh when non_linear
+    # --- side-and-direction asymmetry tables --------------------------------
+    # tightening (<0 prediction)  widening (>0 prediction)
+    asym: dict = field(default_factory=lambda: {          # factor applied
+        "tightening": {"buy": 1.30, "sell": 0.70},
+        "widening"  : {"buy": 0.70, "sell": 1.30}
+    })
+
+def _raw_scale(pred: float, cfg: SkewConfig) -> float:
+    """
+    Turns a prediction magnitude into a *signed* base skew (before asym).
+    Uses tanh envelope if cfg.non_linear else linear.
+    """
+    if cfg.non_linear:
+        # tanh gives linear-ish response near 0 and flattens at extremes
+        return cfg.base_slope * cfg.max_skew * tanh(pred / cfg.nn_width)
+    return cfg.base_slope * pred
+
+def calc_skew(idio_pred_bp: float, side: str, cfg: SkewConfig) -> float:
+    direction = "tightening" if idio_pred_bp < 0 else "widening"
+    asym_factor = cfg.asym[direction][side.lower()]
+
+    base_skew = _raw_scale(idio_pred_bp, cfg)
+    skew = base_skew * asym_factor
+
+    # enforce hard caps
+    return max(-cfg.max_skew, min(cfg.max_skew, skew))
+
+def quote_spread(mid_spread: float,
+                 idio_pred_bp: float,
+                 side: str,
+                 cfg: SkewConfig = SkewConfig()):
+    """
+    Returns the quoted spread and the skew used.
+    """
+    skew = calc_skew(idio_pred_bp, side, cfg)
+    return mid_spread + skew, skew
+
+
+# ---------------------------------------------------------------------------
+# EXAMPLE USAGE
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    mid   = 150.0                 # bp
+    pred  = -4.5                  # expect 4.5 bp tightening
+    side  = "buy"                 # client wants to buy
+
+    quoted, skew = quote_spread(mid, pred, side)
+    print(f"Quoted spread: {quoted:5.2f} bp  (skew {skew:+.2f} bp)")
+
 # RV 
 import pandas as pd
 import numpy as np

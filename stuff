@@ -1,4 +1,151 @@
 """
+rfq_skew.py  – Vectorised skew calculator for corporate-bond RFQs
+-----------------------------------------------------------------
+Given a DataFrame with per-trade columns
+
+    • mid_spread      (float, bp)
+    • idio_pred_bp    (float, bp; +widen / –tighten)
+    • side            ('buy' | 'sell', client perspective)
+
+it adds
+
+    • skew_bp         (float, bp)
+    • quoted_spread   (mid_spread + skew_bp)
+
+Author: <you>
+"""
+
+from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import Literal
+
+import numpy as np
+import pandas as pd
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIG STRUCTURE
+# ─────────────────────────────────────────────────────────────────────────────
+@dataclass
+class SkewConfig:
+    base_slope: float = 0.6         # bp skew per 1 bp predicted move
+    max_skew:  float = 8.0          # hard cap on |skew|
+    non_linear: bool = True         # use tanh envelope?
+    nn_width:   float = 6.0         # tanh width (bp)
+
+    # 2-by-2 asymmetry table: rows = direction, cols = side
+    asym: dict[str, dict[str, float]] = field(
+        default_factory=lambda: {
+            "tightening": {"buy": 1.30, "sell": 0.70},
+            "widening"  : {"buy": 0.70, "sell": 1.30},
+        }
+    )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INTERNAL NUMERIC HELPERS  (NumPy only – fastest)
+# ─────────────────────────────────────────────────────────────────────────────
+def _raw_scale(pred: np.ndarray, cfg: SkewConfig) -> np.ndarray:
+    """
+    Linear or tanh-damped mapping from prediction to *signed* base skew.
+    """
+    if cfg.non_linear:
+        return cfg.base_slope * cfg.max_skew * np.tanh(pred / cfg.nn_width)
+    return cfg.base_slope * pred
+
+
+def _asym_factor(pred: np.ndarray, side: np.ndarray, cfg: SkewConfig) -> np.ndarray:
+    """
+    Fast lookup of the 2×2 asymmetry table for every row:
+        tightening & buy  →  cfg.asym["tightening"]["buy"]
+        tightening & sell →  cfg.asym["tightening"]["sell"]
+        widening   & buy  →  cfg.asym["widening"]["buy"]
+        widening   & sell →  cfg.asym["widening"]["sell"]
+    """
+    tightening = pred < 0
+    is_buy     = np.char.lower(side.astype(str)) == "buy"
+
+    return np.where(
+        tightening,
+        np.where(
+            is_buy,
+            cfg.asym["tightening"]["buy"],
+            cfg.asym["tightening"]["sell"],
+        ),
+        np.where(
+            is_buy,
+            cfg.asym["widening"]["buy"],
+            cfg.asym["widening"]["sell"],
+        ),
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PUBLIC API
+# ─────────────────────────────────────────────────────────────────────────────
+def add_skew(
+    df: pd.DataFrame,
+    *,
+    mid_col:   str = "mid_spread",
+    pred_col:  str = "idio_pred_bp",
+    side_col:  str = "side",
+    cfg: SkewConfig | None = None,
+    inplace: bool = False,
+) -> pd.DataFrame:
+    """
+    Vectorised: returns *df* with two extra columns
+        • 'skew_bp'
+        • 'quoted_spread'
+
+    Parameters
+    ----------
+    df : DataFrame
+        Must contain `mid_col`, `pred_col`, `side_col`.
+    mid_col / pred_col / side_col : str
+        Override if your DataFrame uses different headers.
+    cfg : SkewConfig | None
+        Pass a custom configuration.  If None, defaults are used.
+    inplace : bool
+        If True, mutate `df` directly and return it.
+
+    Returns
+    -------
+    DataFrame
+        Either the modified `df` (inplace=True) or a fresh copy (inplace=False).
+    """
+    cfg = cfg or SkewConfig()
+    target = df if inplace else df.copy()
+
+    pred  = target[pred_col].to_numpy(dtype=float)
+    side  = target[side_col].to_numpy()
+
+    base  = _raw_scale(pred, cfg)
+    skew  = base * _asym_factor(pred, side, cfg)
+    skew  = np.clip(skew, -cfg.max_skew, cfg.max_skew)
+
+    target["skew_bp"]       = skew
+    target["quoted_spread"] = target[mid_col] + skew
+    return target
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EXAMPLE ─ run `python rfq_skew.py` for a quick smoke test
+# ─────────────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    demo = pd.DataFrame(
+        {
+            "bond":         ["XS0001", "US0002", "DE0003", "FR0004"],
+            "mid_spread":   [150.0,    220.0,    95.0,     180.0],
+            "idio_pred_bp": [-4.5,      3.2,     12.0,     -1.0],
+            "side":         ["buy",     "sell",  "buy",    "sell"],
+        }
+    )
+
+    out = add_skew(demo)
+    print(out[["bond", "mid_spread", "idio_pred_bp",
+               "side", "skew_bp", "quoted_spread"]])
+
+------------------------
+
+"""
 Skew helper for corporate-bond RFQs.
 
 Inputs

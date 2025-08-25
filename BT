@@ -1,3 +1,18 @@
+from bond_backtester import BondBacktester
+
+# eod_marks: DataFrame with columns ['isin','date','spread']
+# df: your tape with required columns
+
+engine = BondBacktester(
+    df,
+    quote_func=my_quote,        # or quote_col="quote_spread"
+    eod_marks_df=eod_marks,     # <-- new
+)
+engine.run()
+
+per_trade   = engine.per_trade
+time_series = engine.time_series
+stats       = engine.aggregate_stats
 
 # bond_backtester.py
 # ------------------

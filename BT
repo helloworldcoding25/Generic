@@ -1,81 +1,213 @@
 
+# bond_backtester.py
+# ------------------
+# Lightweight, readable corporate bond RFQ back-tester.
+# - Single-pass event loop with FIFO lot accounting (per ISIN)
+# - Strict win rules (quote < traded for buys, quote > traded for sells)
+# - Realized PnL on closures; Unrealized PnL marked either to:
+#     * last traded spread seen so far (no look-ahead), OR
+#     * user-supplied End-Of-Day (EOD) spread table [isin, date, spread]
+#
+# Goals:
+#   * Maximize speed without sacrificing clarity
+#   * Minimize hidden state / side effects
+#   * Keep API tiny and self-documenting
+#
+# Scaling notes:
+#   * The core pass is O(N). For tens of millions of events, consider:
+#       - Numba-izing the inner loop
+#       - Using Polars for pre/post grouping while retaining this loop
+#       - Chunking by date to cap working sets (lots/inventory)
+#
+# Author: (you)
+# License: MIT (or your choice)
+
+
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
 from collections import deque, defaultdict
 
 try:
-    import polars as pl  # optional, for type recognition and conversion only
+    import polars as pl  # optional: only for type recognition and conversion
     HAS_POLARS = True
 except Exception:
     pl = None
     HAS_POLARS = False
 
+# ------------------------------
+# Public types
+# ------------------------------
+
 Number = Union[int, float]
 
+# Required market-tape columns (single executed-trade feed)
 REQUIRED_COLS = [
     "isin", "size", "dv01", "side", "traded_spread", "datetime", "id"
 ]
 
+
+# ------------------------------
+# Utilities (I/O normalization)
+# ------------------------------
+
 def _ensure_pandas(df: Union[pd.DataFrame, 'pl.DataFrame']) -> pd.DataFrame:
-    """Accept pandas or polars and return a pandas.DataFrame with standard dtypes."""
+    """Normalize input market tape to pandas with clean dtypes.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame or polars.DataFrame
+        Must contain columns: ['isin','size','dv01','side','traded_spread','datetime','id']
+
+    Returns
+    -------
+    pandas.DataFrame
+        Sorted by ['datetime','id'] with normalized/typed columns.
+
+    Notes
+    -----
+    * 'datetime' is coerced to timezone-aware UTC.
+    * 'side' is normalized to lower-case string ('buy' or 'sell').
+    * Sorting is **stable** ('mergesort') to preserve original order for ties.
+    """
     if HAS_POLARS and pl is not None and isinstance(df, pl.DataFrame):
         df = df.to_pandas()
     elif not isinstance(df, pd.DataFrame):
         raise TypeError("Input data must be a pandas.DataFrame or polars.DataFrame")
+
     missing = [c for c in REQUIRED_COLS if c not in df.columns]
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
-    # Dtypes / normalization
-    df = df.copy()
-    df["isin"] = df["isin"].astype(str)
-    df["size"] = pd.to_numeric(df["size"], errors="coerce").astype(float)
-    df["dv01"] = pd.to_numeric(df["dv01"], errors="coerce").astype(float)
-    df["side"] = df["side"].astype(str).str.lower().astype("category")
-    df["traded_spread"] = pd.to_numeric(df["traded_spread"], errors="coerce").astype(float)
-    df["datetime"] = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
-    df["id"] = df["id"].astype(str)
-    df = df.sort_values(["datetime", "id"], kind="mergesort").reset_index(drop=True)
-    return df
+
+    out = df.copy()
+    out["isin"] = out["isin"].astype(str)
+    out["size"] = pd.to_numeric(out["size"], errors="coerce").astype(float)
+    out["dv01"] = pd.to_numeric(out["dv01"], errors="coerce").astype(float)
+    out["side"] = out["side"].astype(str).str.lower()
+    out["traded_spread"] = pd.to_numeric(out["traded_spread"], errors="coerce").astype(float)
+    out["datetime"] = pd.to_datetime(out["datetime"], utc=True, errors="coerce")
+    out["id"] = out["id"].astype(str)
+
+    # Validate 'side' domain (soft check; drop NaNs will be surfaced later in the loop)
+    bad = ~out["side"].isin(["buy","sell"])
+    if bad.any():
+        raise ValueError("'side' must be 'buy' or 'sell' only (lower/upper will be normalized)." )
+
+    # Stable sort
+    out = out.sort_values(["datetime", "id"], kind="mergesort").reset_index(drop=True)
+    return out
+
 
 def _ensure_eod_marks(eod: Union[pd.DataFrame, 'pl.DataFrame']) -> pd.Series:
-    """Return a pandas Series indexed by (isin, date) with the mark spread.
-    Expected columns: ['isin','date','spread'] (date-like daily)."""
+    """Normalize an End-Of-Day marks table into a MultiIndex pandas Series.
+
+    Expected schema
+    ---------------
+    ['isin','date','spread']
+
+    * 'date' can be str/datetime; it will be coerced to date (no tz).
+    * Duplicates on (isin, date) keep the **last** occurrence.
+    * Returned object is a Series indexed by (isin, date).
+
+    Returns
+    -------
+    pandas.Series
+        MultiIndex (isin, date) -> spread (float)
+    """
     if HAS_POLARS and pl is not None and isinstance(eod, pl.DataFrame):
         eod = eod.to_pandas()
     if not isinstance(eod, pd.DataFrame):
         raise TypeError("eod_marks_df must be a pandas.DataFrame or polars.DataFrame")
+
     needed = ["isin", "date", "spread"]
     missing = [c for c in needed if c not in eod.columns]
     if missing:
         raise ValueError(f"EOD marks missing columns: {missing}")
+
     out = eod.copy()
     out["isin"] = out["isin"].astype(str)
-    # Coerce date to date (no timezone)
-    out["date"] = pd.to_datetime(out["date"], utc=False, errors="coerce").dt.date
+    # Convert to **date** (not datetime) to avoid timezone ambiguity in merging
+    out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.date
     out["spread"] = pd.to_numeric(out["spread"], errors="coerce").astype(float)
-    # If duplicates exist, keep the last occurrence
     out = out.dropna(subset=["isin","date"]).drop_duplicates(["isin","date"], keep="last")
+
+    # (isin, date) -> spread
     s = out.set_index(["isin","date"])['spread'].sort_index()
     return s
 
+
+# ------------------------------
+# Core data structures
+# ------------------------------
+
 @dataclass
 class Lot:
-    dv01: float                 # signed dv01 at entry; >0 long, <0 short
-    entry_spread: float         # our transacted (quote) spread
-    entry_time: np.datetime64   # np.datetime64 UTC
+    """A FIFO position lot for a single ISIN.
+
+    Attributes
+    ----------
+    dv01 : float
+        Signed risk at entry. >0 long (we bought), <0 short (we sold).
+    entry_spread : float
+        Our quote level at which the lot was opened.
+    entry_time : np.datetime64
+        Timestamp of entry (UTC). Used for business-day holding time.
+    """
+    dv01: float
+    entry_spread: float
+    entry_time: np.datetime64
+
+
+# ------------------------------
+# Back-testing engine
+# ------------------------------
 
 class BondBacktester:
-    """Lightweight corporate bond backtester (pandas core).
+    """Single-pass RFQ back-tester with FIFO lot accounting.
 
-    - Optional `eod_marks_df` lets you mark unrealized PnL to a daily end-of-day spread
-      (columns: ['isin','date','spread']). When provided, unrealized PnL at *each event*
-      inside a day is computed using that day's mark for each open ISIN. If a mark for a
-      given (isin, date) is missing, we skip marking that ISIN for that event (no fallback).
-      If you prefer a fallback (e.g., last available prior EOD), pre-fill your marks table.
+    Parameters
+    ----------
+    trades : DataFrame
+        Market tape of **executed elsewhere** trades with columns:
+        ['isin','size','dv01','side','traded_spread','datetime','id']
+    quote_func : callable, optional
+        `quote_func(row_dict) -> float`. Provide our **quote spread** for each event.
+        Use either this OR `quote_col`. If both set, `quote_col` wins.
+    quote_col : str, optional
+        Name of column in `trades` that contains our quote spread (float).
+    mark_mode : str, default 'last_trade'
+        Reserved for future (e.g., mid-curve, composite). Ignored if `eod_marks_df` provided.
+    eod_marks_df : DataFrame, optional
+        Daily EOD spreads per ['isin','date','spread']. If present, **unrealized PnL**
+        is marked to that day’s EOD by (isin, date) at every event.
+
+    Notes
+    -----
+    * **Win rules (strict):**
+        BUY wins if `quote_spread < traded_spread`
+        SELL wins if `quote_spread > traded_spread`
+    * **Realized PnL on close:**
+        For matched amount `m` against entry lot spread `S_in` and exit quote `S_out`:
+        `pnl = sign(entry_dv01) * m * (S_in - S_out)`
+    * **Unrealized PnL:**
+        - With EOD marks: use (isin, date) mark for the event's UTC calendar **date**.
+        - Without EOD marks: use last observed traded_spread per ISIN (no look-ahead).
+
+    Output accessors
+    ----------------
+    - `per_trade`   : pandas.DataFrame (one row per input event, plus our fields)
+    - `time_series` : pandas.DataFrame (event-time TS of risk/PnL/ages)
+    - `aggregate_stats` : dict of key summary stats
+    - `won_trades`  : pandas.DataFrame subset where we actually filled (>0 dv01)
+
+    Performance
+    -----------
+    * The engine runs O(N) over NumPy arrays and Python deques.
+    * Avoids DataFrame row-wise ops inside the loop.
+    * For extreme sizes, switch the inner loop to Numba.
     """
 
     def __init__(
@@ -86,7 +218,10 @@ class BondBacktester:
         mark_mode: str = "last_trade",
         eod_marks_df: Optional[Union[pd.DataFrame, 'pl.DataFrame']] = None,
     ):
+        # Normalize and validate input tape
         self.df = _ensure_pandas(trades)
+
+        # Quote sources
         self.quote_func = quote_func
         self.quote_col = quote_col
         self.mark_mode = mark_mode
@@ -96,51 +231,54 @@ class BondBacktester:
         if (quote_col is not None) and (quote_col not in self.df.columns):
             raise ValueError(f"quote_col='{quote_col}' not found in DataFrame.")
 
-        # Prepare EOD marks if provided
+        # Optional EOD marks (MultiIndex Series: (isin, date) -> spread)
         self._eod_marks: Optional[pd.Series] = None
         if eod_marks_df is not None:
             self._eod_marks = _ensure_eod_marks(eod_marks_df)
 
-        self._per_trade = None
-        self._ts = None
-        self._agg = None
-        self._won = None
+        # Output placeholders
+        self._per_trade: Optional[pd.DataFrame] = None
+        self._ts: Optional[pd.DataFrame] = None
+        self._agg: Optional[Dict[str, float]] = None
+        self._won: Optional[pd.DataFrame] = None
         self.results_ready = False
 
+
+    # --------------------------
+    # Main simulation
+    # --------------------------
+
     def run(self) -> None:
-        """Run the simulation.
+        """Execute the back-test (single pass).
 
-        Win rule (strict as requested):
-          - BUY wins if our quote_spread < traded_spread
-          - SELL wins if our quote_spread > traded_spread
-
-        Inventory & PnL:
-          - FIFO lot accounting per ISIN
-          - Realized PnL when closing against prior lots:
-              pnl = sign(entry_dv01) * matched_dv01 * (entry_spread - exit_spread)
-          - Unrealized PnL:
-              * If EOD marks provided: mark to EOD spread for the *row's date*.
-              * Else: mark to last observed traded_spread per ISIN (no lookahead).
+        Steps per event:
+        1) Determine our quote (from column or function).
+        2) Decide if we **win** (strict inequality rules).
+        3) If win:
+              - If risk-reducing: offset FIFO lots -> realize PnL
+              - If risk-increasing: add a new lot
+        4) Compute unrealized PnL using either EOD marks or last-trade marks.
+        5) Update time-series arrays and per-trade diagnostics.
         """
         df = self.df.copy()
 
-        # Compute/attach our quotes
-        if self.quote_col is None:
+        # 1) Compute / attach our quotes efficiently
+        if (self.quote_col is not None):
+            df["quote_spread"] = pd.to_numeric(df[self.quote_col], errors="coerce").astype(float)
+        else:
+            # Avoid row-wise DataFrame operations: iterate tuples, pass dicts to user func
             quotes: List[float] = []
             cols = df.columns.tolist()
-            for row in df.itertuples(index=False, name=None):
-                row_dict = dict(zip(cols, row))
-                q = self.quote_func(row_dict)
-                quotes.append(float(q))
-            df["quote_spread"] = np.array(quotes, dtype=float)
-        else:
-            df["quote_spread"] = pd.to_numeric(df[self.quote_col], errors="coerce").astype(float)
+            for tup in df.itertuples(index=False, name=None):
+                row = dict(zip(cols, tup))
+                quotes.append(float(self.quote_func(row)))
+            df["quote_spread"] = np.asarray(quotes, dtype=float)
 
-        # Arrays for fast access
+        # Extract columns as arrays for speed (avoids pandas overhead in loop)
         isin = df["isin"].to_numpy()
         size = df["size"].to_numpy()
         dv01 = df["dv01"].to_numpy()
-        side = df["side"].astype(str).to_numpy()
+        side = df["side"].to_numpy()        # already lower-case strings
         traded = df["traded_spread"].to_numpy()
         quote = df["quote_spread"].to_numpy()
         times = df["datetime"].to_numpy(dtype="datetime64[ns]")
@@ -148,80 +286,89 @@ class BondBacktester:
 
         n = len(df)
 
-        # State
-        lots: Dict[str, deque] = defaultdict(deque)
-        inv_dv01: Dict[str, float] = defaultdict(float)
-        cost_sum: Dict[str, float] = defaultdict(float)
-        last_mark: Dict[str, float] = {}  # only used if no EOD marks
+        # Per-ISIN state (all dicts): O(#open_isins)
+        lots: Dict[str, deque] = defaultdict(deque)  # FIFO lots
+        inv_dv01: Dict[str, float] = defaultdict(float)  # signed inventory
+        cost_sum: Dict[str, float] = defaultdict(float)  # sum(signed_dv01 * entry_spread)
+        last_mark: Dict[str, float] = {}  # last traded spread (if not using EOD)
 
-        rows = []
-        ts_time = []
-        ts_bal = []
-        ts_real = []
-        ts_unrl = []
-        ts_total = []
-        ts_open_age = []
-        ts_realized_hold = []
+        # Output accumulators (lists -> DataFrame)
+        rows: List[Dict[str, object]] = []
+        ts_time: List[pd.Timestamp] = []
+        ts_bal: List[float] = []
+        ts_real: List[float] = []
+        ts_unrl: List[float] = []
+        ts_total: List[float] = []
+        ts_open_age: List[float] = []
+        ts_realized_hold: List[float] = []
 
-        cum_realized = 0.0
+        cum_realized = 0.0  # running realized PnL
 
+        # ------------------
+        # Event loop (O(N))
+        # ------------------
         for i in range(n):
             s = side[i]
-            is_buy = s == "buy"
-            row_mark = float(traded[i])
-            row_quote = float(quote[i])
+            is_buy = (s == "buy")
+            row_mark = float(traded[i])      # observed market print
+            row_quote = float(quote[i])      # our quote for this RFQ
             row_isin = str(isin[i])
-            row_time = times[i].astype("datetime64[ns]")
-            row_date = pd.Timestamp(row_time).date()
-            row_dv01 = float(dv01[i])
+            row_time = times[i].astype("datetime64[ns]")   # UTC
+            row_date = pd.Timestamp(row_time).date()         # calendar date (for EOD marks)
+            row_dv01 = float(dv01[i])       # positive magnitude (input convention)
 
-            # Update last trade mark (only relevant if no EOD marks provided)
+            # Keep last trade mark updated (used only if no EOD marks supplied)
             if self._eod_marks is None:
                 last_mark[row_isin] = row_mark
 
-            # Win/Fill/Realized
+            # 2) Strict win rule
             won = (row_quote < row_mark) if is_buy else (row_quote > row_mark)
 
+            # Local accumulators for this event
             filled = 0.0
             realized_now = 0.0
             holding_parts: List[Tuple[float, float]] = []  # (dv01_closed, holding_days)
 
+            # 3) If we win, update inventory via FIFO matching
             if won:
                 signed = +row_dv01 if is_buy else -row_dv01
 
-                # risk reducing?
+                # Risk-reducing if new signed is opposite of current inventory sign
                 if inv_dv01[row_isin] != 0 and (np.sign(inv_dv01[row_isin]) != np.sign(signed)):
                     remaining_to_close = min(abs(inv_dv01[row_isin]), abs(signed))
-                    # close against FIFO
+
+                    # Close against FIFO lots
                     while remaining_to_close > 1e-12 and lots[row_isin]:
                         lot = lots[row_isin][0]
                         lot_amt = abs(lot.dv01)
                         close_amt = min(lot_amt, remaining_to_close)
 
+                        # Realized PnL for matched amount
+                        # sign(entry_dv01) picks direction correctly
                         pnl = np.sign(lot.dv01) * close_amt * (lot.entry_spread - row_quote)
                         realized_now += pnl
 
-                        # business day holding
+                        # Business-day holding time from entry lot to this exit
                         start = lot.entry_time.astype("datetime64[D]")
                         end = row_time.astype("datetime64[D]")
                         hold_days = int(np.busday_count(start, end))
                         holding_parts.append((close_amt, hold_days))
 
-                        # shrink or remove lot
+                        # Shrink/close the lot
                         new_amt = lot_amt - close_amt
                         if new_amt <= 1e-12:
                             lots[row_isin].popleft()
                         else:
                             lot.dv01 = np.sign(lot.dv01) * new_amt
 
-                        # update inventory & cost
+                        # Update inventory and cost basis
                         inv_dv01[row_isin] += -np.sign(lot.dv01) * close_amt
                         cost_sum[row_isin] -= np.sign(lot.dv01) * close_amt * lot.entry_spread
 
                         remaining_to_close -= close_amt
                         filled += close_amt
 
-                    # residual becomes new lot if any
+                    # If residual after reducing, that residual is a new lot (flip direction)
                     residual = abs(row_dv01) - filled
                     if residual > 1e-12:
                         new_signed = np.sign(signed) * residual
@@ -229,8 +376,9 @@ class BondBacktester:
                         inv_dv01[row_isin] += new_signed
                         cost_sum[row_isin] += new_signed * row_quote
                         filled += residual
+
                 else:
-                    # risk increasing
+                    # Risk-increasing: create a fresh lot
                     lots[row_isin].append(Lot(dv01=signed, entry_spread=row_quote, entry_time=row_time))
                     inv_dv01[row_isin] += signed
                     cost_sum[row_isin] += signed * row_quote
@@ -239,28 +387,34 @@ class BondBacktester:
                 if abs(realized_now) > 1e-12:
                     cum_realized += realized_now
 
-            # Unrealized pnl & avg open age
+            # 4) Compute unrealized PnL across all open ISINs
             unreal = 0.0
             total_open = 0.0
             age_sum = 0.0
+
             for k, q in inv_dv01.items():
                 if abs(q) < 1e-12:
                     continue
 
-                # choose mark source
-                mkt = None
+                # Select a mark source:
+                # * EOD marks (preferred if provided) -> mark for (isin, row_date)
+                # * Otherwise, last traded spread seen so far
                 if self._eod_marks is not None:
-                    mkt = self._eod_marks.get((k, row_date), np.nan)
-                    if np.isnan(mkt):
-                        continue  # skip if no mark for this day/isin
+                    # MultiIndex Series lookup; skip if missing for the day
+                    try:
+                        mkt = float(self._eod_marks.loc[(k, row_date)])
+                    except KeyError:
+                        continue
                 else:
                     if k not in last_mark:
                         continue
-                    mkt = last_mark[k]
+                    mkt = float(last_mark[k])
 
-                avg_cost = cost_sum[k] / q  # signed
+                # Signed average cost for current inventory (works for long/short)
+                avg_cost = cost_sum[k] / q
                 unreal += q * (avg_cost - mkt)
-                # ages
+
+                # Age accounting: dv01-weighted average open age (business days)
                 for lot in lots[k]:
                     amt = abs(lot.dv01)
                     total_open += amt
@@ -271,6 +425,7 @@ class BondBacktester:
 
             open_age = (age_sum / total_open) if total_open > 0 else np.nan
 
+            # 5) Record per-trade diagnostic row
             rows.append({
                 "id": ids[i],
                 "datetime": pd.Timestamp(row_time).to_pydatetime(),
@@ -290,12 +445,14 @@ class BondBacktester:
                 "avg_open_age_busdays": float(open_age) if not np.isnan(open_age) else np.nan,
             })
 
+            # For the time-series, also compute dv01-weighted average realized holding time
             if len(holding_parts) > 0:
                 w = sum(a for a, _ in holding_parts)
                 avg_hold = sum(a * d for a, d in holding_parts) / w
             else:
                 avg_hold = np.nan
 
+            # Push event-level metrics to the TS buffers
             ts_time.append(pd.Timestamp(row_time).to_pydatetime())
             ts_bal.append(rows[-1]["balance_sheet_abs_dv01"])
             ts_real.append(rows[-1]["cumulative_realized_pnl"])
@@ -304,6 +461,7 @@ class BondBacktester:
             ts_open_age.append(rows[-1]["avg_open_age_busdays"])
             ts_realized_hold.append(avg_hold)
 
+        # Finalize dataframes
         per_trade = pd.DataFrame(rows).sort_values(["datetime", "id"]).reset_index(drop=True)
         ts = pd.DataFrame({
             "datetime": ts_time,
@@ -315,27 +473,34 @@ class BondBacktester:
             "avg_realized_holding_busdays": ts_realized_hold,
         }).sort_values("datetime").reset_index(drop=True)
 
-        # Aggregates
+        # Aggregate statistics (compact but clear)
+        # ---------------------------------------
+        # Balance sheet
         max_bs = float(np.nanmax(ts["balance_sheet_abs_dv01"])) if len(ts) else 0.0
         avg_bs = float(np.nanmean(ts["balance_sheet_abs_dv01"])) if len(ts) else 0.0
 
-        df_pt = per_trade.copy()
-        df_pt["date"] = pd.to_datetime(df_pt["datetime"]).dt.date
+        # EOD series for PnL-based aggregates
         ts_daily = ts.copy()
         ts_daily["date"] = pd.to_datetime(ts_daily["datetime"]).dt.date
         eod = ts_daily.groupby("date", as_index=False).tail(1).set_index("date")
         eod_total = eod["total_pnl"]
-        daily_pnl = eod_total.diff().fillna(eod_total)
+        daily_pnl = eod_total.diff().fillna(eod_total)  # first day change = first level
         avg_daily_pnl = float(daily_pnl.mean()) if len(daily_pnl) else 0.0
         cummax = eod_total.cummax()
         drawdown = eod_total - cummax
         max_drawdown = float(drawdown.min()) if len(drawdown) else 0.0
 
+        # Volumes (won trades only)
+        df_pt = per_trade.copy()
+        df_pt["date"] = pd.to_datetime(df_pt["datetime"]).dt.date
         won = df_pt[(df_pt["won"]) & (df_pt["filled_dv01"] > 0)]
         avg_daily_traded_size = float(won.groupby("date")["size"].sum().mean()) if not won.empty else 0.0
 
+        # Holding periods
         realized_holds = ts["avg_realized_holding_busdays"].dropna()
         realized_avg_holding = float(realized_holds.mean()) if len(realized_holds) else np.nan
+
+        # Current (as-of last event) open-age
         last_open_age = float(ts["avg_open_age_busdays"].dropna().iloc[-1]) if ts["avg_open_age_busdays"].notna().any() else np.nan
 
         self._agg = {
@@ -351,31 +516,41 @@ class BondBacktester:
             "final_unrealized_pnl": float(ts["unrealized_pnl"].iloc[-1]) if len(ts) else 0.0,
         }
 
+        # Store results
         self._per_trade = per_trade
         self._ts = ts
         self._won = won
         self.results_ready = True
 
+
+    # --------------------------
+    # Accessors
+    # --------------------------
+
     @property
     def per_trade(self) -> pd.DataFrame:
+        """Per-event diagnostics (won flag, fills, realized/unrealized/total PnL, balance sheet, ages)."""
         if not self.results_ready:
             raise RuntimeError("Run .run() first")
         return self._per_trade
 
     @property
     def time_series(self) -> pd.DataFrame:
+        """Event-time series: balance sheet, PnL (R/U/T), open-age and realized holding-times."""
         if not self.results_ready:
             raise RuntimeError("Run .run() first")
         return self._ts
 
     @property
     def aggregate_stats(self) -> Dict[str, float]:
+        """Roll-up metrics for quick evaluation and comparisons across runs."""
         if not self.results_ready:
             raise RuntimeError("Run .run() first")
         return self._agg
 
     @property
     def won_trades(self) -> pd.DataFrame:
+        """Subset of trades where our quote actually filled (filled_dv01 > 0)."""
         if not self.results_ready:
             raise RuntimeError("Run .run() first")
         return self._won

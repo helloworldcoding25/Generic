@@ -1,4 +1,544 @@
 
+# (module body identical to previous cell, omitted comment for brevity)
+from dataclasses import dataclass
+from typing import Optional, Callable, Dict, List
+import numpy as np
+import pandas as pd
+from numba import njit
+
+REQUIRED_COLS = ["isin","size","dv01","sideInt","traded_spread","datetime","id"]
+
+def _normalize_trades(df: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(df, pd.DataFrame):
+        raise TypeError("trades must be a pandas DataFrame")
+    miss = [c for c in REQUIRED_COLS if c not in df.columns]
+    if miss:
+        raise ValueError(f"Missing columns: {miss}")
+    out = df.copy()
+    out["isin"] = out["isin"].astype(str)
+    out["size"] = pd.to_numeric(out["size"], errors="coerce").astype(float)
+    out["dv01"] = pd.to_numeric(out["dv01"], errors="coerce").astype(float)
+    out["sideInt"] = pd.to_numeric(out["sideInt"], errors="coerce").astype(int)
+    if (~out["sideInt"].isin([1,-1])).any():
+        raise ValueError("sideInt must be +1 (buy) or -1 (sell)")
+    out["traded_spread"] = pd.to_numeric(out["traded_spread"], errors="coerce").astype(float)
+    out["datetime"] = pd.to_datetime(out["datetime"], utc=True, errors="coerce")
+    out["id"] = out["id"].astype(str)
+    out["date"] = out["datetime"].dt.date
+    out = out.sort_values(["datetime","id"], kind="mergesort").reset_index(drop=True)
+    return out
+
+def _prepare_eod_mark_vector(trades: pd.DataFrame, eod_marks_df: Optional[pd.DataFrame]) -> np.ndarray:
+    if eod_marks_df is None:
+        return np.full(len(trades), np.nan, dtype=np.float64)
+    m = eod_marks_df.copy()
+    need = {"isin","date","spread"}
+    if not need.issubset(m.columns):
+        raise ValueError(f"eod_marks_df missing columns: {sorted(need - set(m.columns))}")
+    m["isin"] = m["isin"].astype(str)
+    m["date"] = pd.to_datetime(m["date"], errors="coerce").dt.date
+    m["spread"] = pd.to_numeric(m["spread"], errors="coerce").astype(float)
+    m = m.dropna(subset=["isin","date"]).drop_duplicates(["isin","date"], keep="last")
+    joined = trades[["isin","date"]].merge(m, on=["isin","date"], how="left")
+    return joined["spread"].to_numpy(dtype=np.float64)
+
+def _business_day_index(dates: np.ndarray) -> np.ndarray:
+    epoch = np.datetime64("1970-01-01")
+    d64 = dates.astype("datetime64[D]")
+    return np.busday_count(epoch, d64).astype(np.int64)
+
+@njit(fastmath=True)
+def process_isin_segment(
+    idx, side, dv01, size, traded, quote, bdi, eod_mark,
+    won, filled_dv01, realized_now, delta_unreal, delta_bs_dv01, delta_bs_size,
+    post_inv_dv01, realized_hold_avg, delta_sum_abs, delta_sum_abs_entry
+):
+    nseg = idx.shape[0]
+    inv = 0.0
+    inv_sz = 0.0
+    cost_sum = 0.0
+    open_abs = 0.0
+    open_abs_entry = 0.0
+
+    lot_dv = np.zeros(nseg)
+    lot_sz = np.zeros(nseg)
+    lot_sp = np.zeros(nseg)
+    lot_b  = np.zeros(nseg, np.int64)
+    head = 0
+    tail = 0
+
+    for j in range(nseg):
+        i = idx[j]
+        is_buy = (side[i] == 1)
+        q = quote[i]; m = traded[i]
+        dv = dv01[i]; sz = size[i]
+        bi = bdi[i]; mark = eod_mark[i]
+
+        prev_inv = inv; prev_inv_sz = inv_sz
+        prev_unr = 0.0
+        if prev_inv != 0.0 and not np.isnan(mark):
+            prev_unr = (cost_sum/prev_inv - mark) * prev_inv
+
+        w = (q < m) if is_buy else (q > m)
+        won[i] = w
+
+        fill = 0.0; fill_sz = 0.0; r_now = 0.0
+        hold_w_sum = 0.0; hold_dv_sum = 0.0
+        d_sum_abs = 0.0; d_sum_abs_entry = 0.0
+
+        if w:
+            sgn = 1.0 if is_buy else -1.0
+            want_dv = sgn * dv; want_sz = sgn * sz
+
+            if inv != 0.0 and np.sign(inv) != np.sign(want_dv):
+                remaining = min(abs(inv), abs(want_dv))
+                while remaining > 1e-12 and head < tail:
+                    ldv = lot_dv[head]; lsz = lot_sz[head]; lsp = lot_sp[head]; lbi = lot_b[head]
+                    amt = abs(ldv)
+                    close_amt = amt if amt <= remaining else remaining
+                    frac = close_amt / amt
+                    close_sz = abs(lsz) * frac
+
+                    r_now += np.sign(ldv) * close_amt * (lsp - q)
+                    hold_days = bi - lbi; hold_w_sum += close_amt * hold_days; hold_dv_sum += close_amt
+
+                    new_amt = amt - close_amt
+                    if new_amt <= 1e-12:
+                        head += 1
+                    else:
+                        lot_dv[head] = np.sign(ldv) * new_amt
+                        lot_sz[head] = np.sign(lsz) * (abs(lsz) - close_sz)
+
+                    inv += -np.sign(ldv) * close_amt
+                    inv_sz += -np.sign(lsz) * close_sz
+                    cost_sum -= np.sign(ldv) * close_amt * lsp
+
+                    open_abs -= close_amt
+                    open_abs_entry -= close_amt * lbi
+                    d_sum_abs -= close_amt
+                    d_sum_abs_entry -= close_amt * lbi
+
+                    remaining -= close_amt
+                    fill += close_amt; fill_sz += close_sz
+
+                residual = abs(want_dv) - fill
+                if residual > 1e-12:
+                    new_signed = np.sign(want_dv) * residual
+                    ratio = residual / abs(want_dv)
+                    new_sz = np.sign(want_sz) * (abs(want_sz) * ratio)
+
+                    lot_dv[tail] = new_signed; lot_sz[tail] = new_sz
+                    lot_sp[tail] = q; lot_b[tail]  = bi; tail += 1
+
+                    inv += new_signed; inv_sz += new_sz; cost_sum += new_signed * q
+                    open_abs += abs(new_signed); open_abs_entry += abs(new_signed) * bi
+                    d_sum_abs += abs(new_signed); d_sum_abs_entry += abs(new_signed) * bi
+
+                    fill += residual; fill_sz += abs(new_sz)
+            else:
+                new_signed = want_dv; new_sz = want_sz
+                lot_dv[tail] = new_signed; lot_sz[tail] = new_sz
+                lot_sp[tail] = q; lot_b[tail]  = bi; tail += 1
+
+                inv += new_signed; inv_sz += new_sz; cost_sum += new_signed * q
+                open_abs += abs(new_signed); open_abs_entry += abs(new_signed) * bi
+                d_sum_abs += abs(new_signed); d_sum_abs_entry += abs(new_signed) * bi
+
+                fill = abs(new_signed); fill_sz = abs(new_sz)
+
+        new_inv = inv
+        unr_k = 0.0
+        if new_inv != 0.0 and not np.isnan(mark):
+            avg_cost = cost_sum / new_inv
+            unr_k = new_inv * (avg_cost - mark)
+
+        delta_unreal[i] = (unr_k - prev_unr)
+        delta_bs_dv01[i] = abs(new_inv) - abs(prev_inv)
+        delta_bs_size[i] = abs(inv_sz) - abs(prev_inv_sz)
+        filled_dv01[i] = fill if w else 0.0
+        realized_now[i] = r_now if w else 0.0
+        post_inv_dv01[i] = new_inv
+        realized_hold_avg[i] = (hold_w_sum / hold_dv_sum) if hold_dv_sum > 0 else np.nan
+        delta_sum_abs[i] = d_sum_abs
+        delta_sum_abs_entry[i] = d_sum_abs_entry
+
+@njit(fastmath=True)
+def process_global_chrono(
+    isin_code, side, dv01, size, traded, quote_base, bdi, eod_mark,
+    offsets, lengths,  # per-ISIN FIFO slice (flat arrays indexing)
+    lot_dv, lot_sz, lot_sp, lot_bi, head, tail,
+    cap_size, same_day_adjust_bp,
+    # outputs (per-row full level series)
+    won, filled_dv01, realized_now, cum_realized,
+    unrl_delta, unrl_total, total_cum_pnl,
+    bs_dv01, bs_size, cum_gross_size, cum_bs_size,
+    avg_open_age, realized_hold_avg, post_inv_dv01,
+    quote_after_rules, gated_by_cap
+):
+    n = isin_code.shape[0]
+    n_isin = head.shape[0]
+
+    inv = np.zeros(n_isin)
+    inv_sz = np.zeros(n_isin)
+    cost_sum = np.zeros(n_isin)
+    last_win_bdi = np.full(n_isin, -10_000, np.int64)
+
+    global_unrl = 0.0
+    global_bs_dv01 = 0.0
+    global_bs_size = 0.0
+    global_sum_abs = 0.0
+    global_sum_abs_entry = 0.0
+    cum_real = 0.0
+    cum_gross = 0.0
+    cum_bs_size_accum = 0.0
+
+    for i in range(n):
+        k = int(isin_code[i])
+        is_buy = (side[i] == 1)
+        sgn = 1.0 if is_buy else -1.0
+        q0 = quote_base[i]
+        q = q0
+
+        if last_win_bdi[k] == bdi[i] and same_day_adjust_bp != 0.0:
+            q = q + side[i] * same_day_adjust_bp
+
+        delta_bs_if_fill = abs(inv_sz[k] + sgn * size[i]) - abs(inv_sz[k])
+        gate = False
+        if delta_bs_if_fill > 0.0 and (global_bs_size + delta_bs_if_fill) > cap_size:
+            gate = True
+
+        m = traded[i]
+        w = False if gate else ((q < m) if is_buy else (q > m))
+        won[i] = w
+        quote_after_rules[i] = q
+        gated_by_cap[i] = gate
+
+        mark = eod_mark[i]
+
+        prev_inv = inv[k]; prev_inv_sz = inv_sz[k]
+        prev_unr_k = 0.0
+        if prev_inv != 0.0 and not np.isnan(mark):
+            prev_unr_k = (cost_sum[k]/prev_inv - mark) * prev_inv
+
+        fill = 0.0; fill_sz = 0.0; r_now = 0.0
+        hold_w_sum = 0.0; hold_dv_sum = 0.0
+
+        if w:
+            want_dv = sgn * dv01[i]; want_sz = sgn * size[i]
+
+            if prev_inv != 0.0 and np.sign(prev_inv) != np.sign(want_dv):
+                remaining = abs(want_dv) if abs(prev_inv) >= abs(want_dv) else abs(prev_inv)
+                base = offsets[k]; h = head[k]; t = tail[k]
+                while remaining > 1e-12 and h < t:
+                    ldv = lot_dv[base + h]; lsz = lot_sz[base + h]
+                    lsp = lot_sp[base + h]; lbi = lot_bi[base + h]
+                    amt = abs(ldv)
+                    close_amt = amt if amt <= remaining else remaining
+                    frac = close_amt / amt
+                    close_sz = abs(lsz) * frac
+
+                    r_now += np.sign(ldv) * close_amt * (lsp - q)
+                    hold_days = bdi[i] - lbi
+                    hold_w_sum += close_amt * hold_days
+                    hold_dv_sum += close_amt
+
+                    new_amt = amt - close_amt
+                    if new_amt <= 1e-12:
+                        h += 1
+                    else:
+                        lot_dv[base + h] = np.sign(ldv) * new_amt
+                        lot_sz[base + h] = np.sign(lsz) * (abs(lsz) - close_sz)
+
+                    inv[k] += -np.sign(ldv) * close_amt
+                    inv_sz[k] += -np.sign(lsz) * close_sz
+                    cost_sum[k] -= np.sign(ldv) * close_amt * lsp
+
+                    global_sum_abs -= close_amt
+                    global_sum_abs_entry -= close_amt * lbi
+
+                    remaining -= close_amt
+                    fill += close_amt; fill_sz += close_sz
+
+                head[k] = h
+
+                residual = abs(want_dv) - fill
+                if residual > 1e-12:
+                    new_signed = np.sign(want_dv) * residual
+                    ratio = residual / abs(want_dv)
+                    new_sz = np.sign(want_sz) * (abs(want_sz) * ratio)
+
+                    pos = offsets[k] + tail[k]
+                    lot_dv[pos] = new_signed; lot_sz[pos] = new_sz
+                    lot_sp[pos] = q; lot_bi[pos] = bdi[i]
+                    tail[k] += 1
+
+                    inv[k] += new_signed; inv_sz[k] += new_sz; cost_sum[k] += new_signed * q
+
+                    global_sum_abs += abs(new_signed)
+                    global_sum_abs_entry += abs(new_signed) * bdi[i]
+
+                    fill += residual; fill_sz += abs(new_sz)
+            else:
+                new_signed = want_dv; new_sz = want_sz
+                pos = offsets[k] + tail[k]
+                lot_dv[pos] = new_signed; lot_sz[pos] = new_sz
+                lot_sp[pos] = q; lot_bi[pos] = bdi[i]
+                tail[k] += 1
+
+                inv[k] += new_signed; inv_sz[k] += new_sz; cost_sum[k] += new_signed * q
+
+                global_sum_abs += abs(new_signed)
+                global_sum_abs_entry += abs(new_signed) * bdi[i]
+
+                fill = abs(new_signed); fill_sz = abs(new_sz)
+
+            if r_now != 0.0:
+                cum_real += r_now
+            if fill_sz > 0.0:
+                cum_gross += fill_sz
+
+            last_win_bdi[k] = bdi[i]
+
+        new_inv = inv[k]
+        unr_k = 0.0
+        if new_inv != 0.0 and not np.isnan(mark):
+            avg_cost = cost_sum[k] / new_inv
+            unr_k = new_inv * (avg_cost - mark)
+        du = (unr_k - prev_unr_k)
+        global_unrl += du
+
+        global_bs_dv01 += (abs(new_inv) - abs(prev_inv))
+        global_bs_size += (abs(inv_sz[k]) - abs(prev_inv_sz))
+        cum_bs_size_accum += global_bs_size
+
+        filled_dv01[i] = fill if w else 0.0
+        realized_now[i] = r_now if w else 0.0
+        cum_realized[i] = cum_real
+        unrl_delta[i] = du
+        unrl_total[i] = global_unrl
+        total_cum_pnl[i] = cum_real + global_unrl
+        bs_dv01[i] = global_bs_dv01
+        bs_size[i] = global_bs_size
+        cum_gross_size[i] = cum_gross
+        cum_bs_size[i] = cum_bs_size_accum
+        post_inv_dv01[i] = new_inv
+
+        if global_sum_abs > 0.0:
+            avg_open_age[i] = (bdi[i] * global_sum_abs - global_sum_abs_entry) / global_sum_abs
+        else:
+            avg_open_age[i] = np.nan
+
+        realized_hold_avg[i] = (hold_w_sum / hold_dv_sum) if hold_dv_sum > 0.0 else np.nan
+
+from dataclasses import dataclass
+
+@dataclass
+class UltraConfig:
+    cap_size: float = 1.0e20
+    same_day_win_adjust_bp: float = 0.0
+
+class UltraFastBacktester:
+    def __init__(
+        self,
+        trades: pd.DataFrame,
+        quote_col: Optional[str] = None,
+        quote_func: Optional[Callable[[Dict[str, object]], float]] = None,
+        eod_marks_df: Optional[pd.DataFrame] = None,
+        cap_size: float = 1.0e20,
+        same_day_win_adjust_bp: float = 0.0,
+    ):
+        self.df = _normalize_trades(trades)
+        if (quote_col is None) and (quote_func is None):
+            raise ValueError("Provide quote_col or quote_func")
+        if quote_col is not None and quote_col not in self.df.columns:
+            raise ValueError(f"quote_col '{quote_col}' not found")
+        self.quote_col = quote_col
+        self.quote_func = quote_func
+        self.marks = _prepare_eod_mark_vector(self.df, eod_marks_df)
+        self.cfg = UltraConfig(cap_size=cap_size, same_day_win_adjust_bp=same_day_win_adjust_bp)
+        self._per_trade = None
+
+    def run(self, mode: str = "global") -> None:
+        df = self.df
+        n = len(df)
+
+        if self.quote_col is None:
+            quotes = np.empty(n, dtype=np.float64)
+            cols = df.columns.to_list()
+            for i, row in enumerate(df.itertuples(index=False, name=None)):
+                quotes[i] = float(self.quote_func(dict(zip(cols, row))))
+        else:
+            quotes = pd.to_numeric(df[self.quote_col], errors="coerce").astype(float).to_numpy()
+
+        isin_codes, uniques = pd.factorize(df["isin"], sort=True)
+        isin_codes = isin_codes.astype(np.int64)
+        n_isin = len(uniques)
+
+        counts = np.bincount(isin_codes, minlength=n_isin).astype(np.int64)
+        offsets = np.zeros(n_isin, dtype=np.int64)
+        if n_isin > 0:
+            offsets[1:] = np.cumsum(counts[:-1])
+        total_capacity = counts.sum()
+
+        lot_dv = np.zeros(total_capacity, dtype=np.float64)
+        lot_sz = np.zeros(total_capacity, dtype=np.float64)
+        lot_sp = np.zeros(total_capacity, dtype=np.float64)
+        lot_bi = np.zeros(total_capacity, dtype=np.int64)
+        head = np.zeros(n_isin, dtype=np.int64)
+        tail = np.zeros(n_isin, dtype=np.int64)
+
+        side = df["sideInt"].to_numpy(np.int8)
+        size = df["size"].to_numpy(np.float64)
+        dv01 = df["dv01"].to_numpy(np.float64)
+        traded = df["traded_spread"].to_numpy(np.float64)
+        dt64 = df["datetime"].to_numpy("datetime64[ns]")
+        ids = df["id"].to_numpy(str)
+        dates = df["date"].to_numpy()
+        bdi = _business_day_index(dates)
+
+        won = np.zeros(n, dtype=np.bool_)
+        filled_dv01 = np.zeros(n, dtype=np.float64)
+        realized_now = np.zeros(n, dtype=np.float64)
+        cum_real = np.zeros(n, dtype=np.float64)
+        unrl_delta = np.zeros(n, dtype=np.float64)
+        unrl_total = np.zeros(n, dtype=np.float64)
+        total_cum_pnl = np.zeros(n, dtype=np.float64)
+        bs_dv01 = np.zeros(n, dtype=np.float64)
+        bs_size = np.zeros(n, dtype=np.float64)
+        cum_gross_size = np.zeros(n, dtype=np.float64)
+        cum_bs_size = np.zeros(n, dtype=np.float64)
+        avg_open_age = np.full(n, np.nan, dtype=np.float64)
+        realized_hold_avg = np.full(n, np.nan, dtype=np.float64)
+        post_isin_dv01 = np.zeros(n, dtype=np.float64)
+        quote_after_rules = np.zeros(n, dtype=np.float64)
+        gated_by_cap = np.zeros(n, dtype=np.bool_)
+
+        if mode == "global":
+            process_global_chrono(
+                isin_codes, side, dv01, size, traded, quotes, bdi, self.marks,
+                offsets, counts,
+                lot_dv, lot_sz, lot_sp, lot_bi, head, tail,
+                float(self.cfg.cap_size), float(self.cfg.same_day_win_adjust_bp),
+                won, filled_dv01, realized_now, cum_real,
+                unrl_delta, unrl_total, total_cum_pnl,
+                bs_dv01, bs_size, cum_gross_size, cum_bs_size,
+                avg_open_age, realized_hold_avg, post_isin_dv01,
+                quote_after_rules, gated_by_cap
+            )
+
+            out = pd.DataFrame({
+                "id": ids,
+                "datetime": dt64,
+                "date": dates,
+                "isin": df["isin"].to_numpy(str),
+                "sideInt": side.astype(np.int16),
+                "size": size,
+                "dv01": dv01,
+                "traded_spread": traded,
+                "quote_spread": quotes,
+                "quote_after_rules": quote_after_rules,
+                "gated_by_cap": gated_by_cap,
+                "eod_mark_spread": self.marks,
+                "won": won,
+                "filled_dv01": filled_dv01,
+                "realized_pnl_this_trade": realized_now,
+                "cumulative_realized_pnl": cum_real,
+                "unrealized_pnl_this_trade": unrl_delta,
+                "total_unrealized_pnl": unrl_total,
+                "total_cumulative_pnl": total_cum_pnl,
+                "balance_sheet_abs_dv01": bs_dv01,
+                "balance_sheet_abs_size": bs_size,
+                "cumulative_gross_traded_size": cum_gross_size,
+                "cumulative_balance_sheet_abs_size": cum_bs_size,
+                "avg_open_age_busdays": avg_open_age,
+                "avg_realized_holding_busdays": realized_hold_avg,
+                "post_isin_inventory_dv01": post_isin_dv01,
+            }).sort_values(["datetime","id"]).reset_index(drop=True)
+
+        elif mode == "per_isin":
+            unique_codes = np.arange(n_isin, dtype=np.int64)
+            index_lists: List[np.ndarray] = [np.where(isin_codes == k)[0].astype(np.int64) for k in unique_codes]
+
+            delta_unreal = np.zeros(n, dtype=np.float64)
+            delta_bs_dv01 = np.zeros(n, dtype=np.float64)
+            delta_bs_size = np.zeros(n, dtype=np.float64)
+            delta_sum_abs = np.zeros(n, dtype=np.float64)
+            delta_sum_abs_entry = np.zeros(n, dtype=np.float64)
+
+            for k in unique_codes:
+                idx = index_lists[k]
+                if idx.size == 0:
+                    continue
+                process_isin_segment(
+                    idx, side, dv01, size, traded, quotes, bdi, self.marks,
+                    won, filled_dv01, realized_now, delta_unreal, delta_bs_dv01, delta_bs_size,
+                    post_isin_dv01, realized_hold_avg, delta_sum_abs, delta_sum_abs_entry
+                )
+
+            cum_real = np.cumsum(realized_now)
+            unrl_total = np.cumsum(delta_unreal)
+            total_cum_pnl = cum_real + unrl_total
+            bs_dv01 = np.cumsum(delta_bs_dv01)
+            bs_size = np.cumsum(delta_bs_size)
+            filled_ratio = np.divide(filled_dv01, np.where(dv01==0.0, 1.0, dv01), where=(dv01!=0.0))
+            filled_ratio = np.clip(filled_ratio, 0.0, 1.0)
+            gross_trade_size = np.where(won, np.abs(size * filled_ratio), 0.0)
+            cum_gross_size = np.cumsum(gross_trade_size)
+            cum_bs_size = np.cumsum(bs_size)
+
+            SumAbs = np.cumsum(delta_sum_abs)
+            EntrySum = np.cumsum(delta_sum_abs_entry)
+            avg_open_age = np.where(SumAbs > 0, (bdi * SumAbs - EntrySum) / SumAbs, np.nan)
+
+            out = pd.DataFrame({
+                "id": ids,
+                "datetime": dt64,
+                "date": dates,
+                "isin": df["isin"].to_numpy(str),
+                "sideInt": side.astype(np.int16),
+                "size": size,
+                "dv01": dv01,
+                "traded_spread": traded,
+                "quote_spread": quotes,
+                "quote_after_rules": quotes,
+                "gated_by_cap": np.zeros(n, dtype=bool),
+                "eod_mark_spread": self.marks,
+                "won": won,
+                "filled_dv01": filled_dv01,
+                "realized_pnl_this_trade": realized_now,
+                "cumulative_realized_pnl": cum_real,
+                "unrealized_pnl_this_trade": delta_unreal,
+                "total_unrealized_pnl": unrl_total,
+                "total_cumulative_pnl": total_cum_pnl,
+                "balance_sheet_abs_dv01": bs_dv01,
+                "balance_sheet_abs_size": bs_size,
+                "cumulative_gross_traded_size": cum_gross_size,
+                "cumulative_balance_sheet_abs_size": cum_bs_size,
+                "avg_open_age_busdays": avg_open_age,
+                "avg_realized_holding_busdays": realized_hold_avg,
+                "post_isin_inventory_dv01": post_isin_dv01,
+            }).sort_values(["datetime","id"]).reset_index(drop=True)
+        else:
+            raise ValueError("mode must be 'global' or 'per_isin'")
+
+        self._per_trade = out
+
+    @property
+    def per_trade(self) -> pd.DataFrame:
+        if self._per_trade is None:
+            raise RuntimeError("Run .run() first")
+        return self._per_trade
+
+
+
+
+
+
+
+
+
+
+
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple, Union

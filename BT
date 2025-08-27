@@ -1,3 +1,20 @@
+import pandas as pd, numpy as np
+from bond_backtester_ultra import UltraFastBacktester
+
+# df requires: isin,size,dv01,sideInt,traded_spread,datetime,id
+df["quote_spread"] = df["traded_spread"] + np.where(df["sideInt"]==1, -0.6, +0.6)
+
+# Optional EOD marks: ['isin','date','spread']
+bt = UltraFastBacktester(
+    df,
+    quote_col="quote_spread",
+    eod_marks_df=eod_df,            # or None
+    cap_size=500_000_000.0,         # size-based gross cap (very large to disable)
+    same_day_win_adjust_bp=0.5      # widen by 0.5bp after same-day win on same ISIN
+)
+bt.run(mode="global")               # or "per_isin"
+per_trade = bt.per_trade
+
 
 # (module body identical to previous cell, omitted comment for brevity)
 from dataclasses import dataclass

@@ -1,4 +1,316 @@
 
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Callable, Dict, List, Optional, Tuple, Union
+import numpy as np
+import pandas as pd
+from collections import deque, defaultdict
+
+# Base schema now prefers 'sideInt' (±1). We still map from 'side' if needed.
+REQUIRED_COLS_BASE = ["isin","size","dv01","traded_spread","datetime","id"]
+
+def _ensure_pandas(df: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(df, pd.DataFrame):
+        raise TypeError("Input data must be a pandas DataFrame (pandas-only module).")
+    miss = [c for c in REQUIRED_COLS_BASE if c not in df.columns]
+    if miss:
+        raise ValueError(f"Missing required columns: {miss}")
+    out = df.copy()
+
+    # Normalize identity columns
+    out["isin"] = out["isin"].astype(str)
+    out["size"] = pd.to_numeric(out["size"], errors="coerce").astype(float)
+    out["dv01"] = pd.to_numeric(out["dv01"], errors="coerce").astype(float)
+    out["traded_spread"] = pd.to_numeric(out["traded_spread"], errors="coerce").astype(float)
+    out["datetime"] = pd.to_datetime(out["datetime"], utc=True, errors="coerce")
+    out["id"] = out["id"].astype(str)
+
+    # Accept either 'sideInt' (preferred) or legacy 'side' -> map to sideInt
+    if "sideInt" in out.columns:
+        out["sideInt"] = pd.to_numeric(out["sideInt"], errors="coerce").astype(int)
+        bad = ~out["sideInt"].isin([1,-1])
+        if bad.any():
+            raise ValueError("sideInt must be +1 (buy) or -1 (sell).")
+    elif "side" in out.columns:
+        tmp = out["side"].astype(str).str.lower().map({"buy":1, "sell":-1})
+        if tmp.isna().any():
+            raise ValueError("Legacy 'side' must contain only 'buy' or 'sell'.")
+        out["sideInt"] = tmp.astype(int)
+    else:
+        raise ValueError("Provide 'sideInt' (±1). Legacy 'side' accepted but will be removed later.")
+
+    out = out.sort_values(["datetime","id"], kind="mergesort").reset_index(drop=True)
+    return out
+
+def _prepare_eod_marks(eod: pd.DataFrame) -> Dict[Tuple[str, object], float]:
+    if not isinstance(eod, pd.DataFrame):
+        raise TypeError("eod_marks_df must be a pandas DataFrame.")
+    need = {"isin","date","spread"}
+    if not need.issubset(eod.columns):
+        raise ValueError(f"EOD marks missing columns: {sorted(need - set(eod.columns))}")
+    df = eod.copy()
+    df["isin"] = df["isin"].astype(str)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+    df["spread"] = pd.to_numeric(df["spread"], errors="coerce").astype(float)
+    df = df.dropna(subset=["isin","date"]).drop_duplicates(["isin","date"], keep="last")
+    return {(r.isin, r.date): float(r.spread) for r in df.itertuples(index=False)}
+
+@dataclass
+class Lot:
+    dv01: float
+    entry_spread: float
+    entry_time: np.datetime64
+    size: float
+
+# -------------------------------
+# FastPerTradeBacktester (sideInt)
+# -------------------------------
+
+class FastPerTradeBacktester:
+    """Single-pass, per-trade-first engine with unrealized, balance sheet, holding times.
+    Expects 'sideInt' (+1=buy, -1=sell) in the input. If only legacy 'side' exists,
+    it will be mapped during normalization.
+
+    For max speed: use quote_col instead of quote_func.
+    """
+    def __init__(
+        self,
+        trades: pd.DataFrame,
+        quote_col: Optional[str] = None,
+        quote_func: Optional[Callable[[dict], float]] = None,
+        eod_marks_df: Optional[pd.DataFrame] = None,
+    ):
+        self.df = _ensure_pandas(trades)
+        if (quote_col is None) and (quote_func is None):
+            raise ValueError("Provide quote_col or quote_func.")
+        if (quote_col is not None) and (quote_col not in self.df.columns):
+            raise ValueError(f"quote_col '{quote_col}' not found.")
+        self.quote_col = quote_col
+        self.quote_func = quote_func
+        self._marks = _prepare_eod_marks(eod_marks_df) if eod_marks_df is not None else None
+        self._per_trade = None
+
+    def run(self, use_numba: bool = False, validate_outputs: bool = False, rtol: float = 1e-10, atol: float = 1e-12) -> None:
+        # Implemented below in subclass patch to support Numba. Placeholder here.
+        raise NotImplementedError("Run method is patched in later (Numba-enabled) section.")
+
+    @property
+    def per_trade(self) -> pd.DataFrame:
+        if self._per_trade is None: raise RuntimeError("Run .run() first")
+        return self._per_trade
+
+
+
+try:
+    from numba import njit
+    _HAS_NUMBA = True
+except Exception:
+    _HAS_NUMBA = False
+    def njit(*args, **kwargs):
+        def deco(f):
+            return f
+        return deco
+
+@njit(cache=True)
+def _won_rule_numba(q: float, m: float, is_buy_flag: int) -> int:
+    # is_buy_flag: 1 if sideInt==+1 else 0
+    return 1 if ((q < m) if (is_buy_flag == 1) else (q > m)) else 0
+
+class FastPerTradeBacktester(FastPerTradeBacktester):
+    def run(self, use_numba: bool = False, validate_outputs: bool = False, rtol: float = 1e-10, atol: float = 1e-12) -> None:
+        if validate_outputs:
+            self._run_impl(use_numba=False)
+            base = self._per_trade.copy()
+            self._run_impl(use_numba=use_numba and _HAS_NUMBA)
+            test = self._per_trade.copy()
+
+            cols = [
+                "won","filled_dv01","realized_pnl_this_trade","cumulative_realized_pnl",
+                "unrealized_pnl_this_trade","total_unrealized_pnl","balance_sheet_abs_dv01",
+                "balance_sheet_abs_size","cumulative_gross_traded_size",
+                "avg_open_age_busdays","avg_realized_holding_busdays","post_isin_inventory_dv01"
+            ]
+            for c in cols:
+                a = pd.to_numeric(base[c], errors="coerce")
+                b = pd.to_numeric(test[c], errors="coerce")
+                if not np.allclose(a.values, b.values, rtol=rtol, atol=atol, equal_nan=True):
+                    raise AssertionError(f"Mismatch in column '{c}' between numba-off and numba-on runs")
+            self._per_trade = test
+        else:
+            self._run_impl(use_numba=use_numba and _HAS_NUMBA)
+
+    def _run_impl(self, use_numba: bool) -> None:
+        df = self.df
+        # Quotes
+        if self.quote_col is None:
+            quotes=[]; cols=df.columns.tolist()
+            for tup in df.itertuples(index=False, name=None):
+                quotes.append(float(self.quote_func(dict(zip(cols, tup)))))
+            quote = np.asarray(quotes, dtype=float)
+        else:
+            quote = pd.to_numeric(df[self.quote_col], errors="coerce").astype(float).to_numpy()
+
+        isin = df["isin"].to_numpy()
+        side_int = df["sideInt"].to_numpy().astype(np.int8)
+        traded = df["traded_spread"].to_numpy()
+        dv01 = df["dv01"].to_numpy()
+        size = df["size"].to_numpy()
+        times = df["datetime"].to_numpy(dtype="datetime64[ns]")
+        ids = df["id"].to_numpy()
+
+        n = len(df)
+        lots = defaultdict(deque)
+        inv = defaultdict(float)          # signed dv01
+        inv_size = defaultdict(float)     # signed size
+        cost_sum = defaultdict(float)     # signed dv01 * entry_spread
+        last_trade_mark = {}
+
+        rows=[]; append=rows.append
+        ABS=abs; SIGN=np.sign; EPS=1e-12
+        cum_realized=0.0; prev_unreal_total=0.0
+        cum_gross_traded_size = 0.0
+        cum_balance_sheet_abs_size = 0.0
+
+        for i in range(n):
+            is_buy = (side_int[i] == 1)
+            q = float(quote[i]); m = float(traded[i])
+            my_isin = isin[i]
+            t_ns = times[i]; t = pd.Timestamp(t_ns); d = t.date()
+            dv = float(dv01[i]); sz = float(size[i])
+
+            if self._marks is None:
+                last_trade_mark[my_isin] = m
+
+            if use_numba:
+                won = bool(_won_rule_numba(q, m, 1 if is_buy else 0))
+            else:
+                won = (q < m) if is_buy else (q > m)
+
+            filled = 0.0; filled_size = 0.0; realized_now = 0.0
+            realized_hold_parts = []
+
+            if won:
+                signed = (1.0 if is_buy else -1.0) * dv
+                signed_size = (1.0 if is_buy else -1.0) * sz
+                inv_isin = inv[my_isin]
+
+                if inv_isin != 0.0 and (SIGN(inv_isin) != SIGN(signed)):
+                    remaining = min(ABS(inv_isin), ABS(signed))
+                    dq = lots[my_isin]
+                    while remaining > EPS and dq:
+                        lot = dq[0]
+                        lot_amt = ABS(lot.dv01)
+                        close_amt = lot_amt if lot_amt <= remaining else remaining
+                        close_size = ABS(lot.size) * (close_amt / lot_amt) if lot_amt > 0 else 0.0
+
+                        realized_now += SIGN(lot.dv01) * close_amt * (lot.entry_spread - q)
+
+                        start = lot.entry_time.astype("datetime64[D]"); end = t_ns.astype("datetime64[D]")
+                        hold_days = int(np.busday_count(start, end))
+                        realized_hold_parts.append((close_amt, hold_days))
+
+                        new_amt = lot_amt - close_amt
+                        if new_amt <= EPS:
+                            dq.popleft()
+                        else:
+                            lot.dv01 = SIGN(lot.dv01) * new_amt
+                            lot.size = SIGN(lot.size) * (ABS(lot.size) - close_size)
+
+                        inv[my_isin] += -SIGN(lot.dv01) * close_amt
+                        inv_size[my_isin] += -SIGN(lot.size) * close_size
+                        cost_sum[my_isin] -= SIGN(lot.dv01) * close_amt * lot.entry_spread
+
+                        remaining -= close_amt; filled += close_amt; filled_size += close_size
+
+                    residual = ABS(dv) - filled
+                    if residual > EPS:
+                        ratio = residual / ABS(dv) if ABS(dv) > 0 else 0.0
+                        new_signed = SIGN(signed) * residual
+                        new_size_signed = SIGN(signed_size) * (ABS(sz) * ratio)
+                        lots[my_isin].append(Lot(dv01=new_signed, entry_spread=q, entry_time=t_ns, size=new_size_signed))
+                        inv[my_isin] += new_signed; inv_size[my_isin] += new_size_signed
+                        cost_sum[my_isin] += new_signed * q
+                        filled += residual; filled_size += ABS(new_size_signed)
+                else:
+                    new_signed = signed; new_size_signed = signed_size
+                    lots[my_isin].append(Lot(dv01=new_signed, entry_spread=q, entry_time=t_ns, size=new_size_signed))
+                    inv[my_isin] += new_signed; inv_size[my_isin] += new_size_signed; cost_sum[my_isin] += new_signed * q
+                    filled = ABS(new_signed); filled_size = ABS(new_size_signed)
+
+                if realized_now != 0.0: cum_realized += realized_now
+                if filled_size > 0.0: cum_gross_traded_size += filled_size
+
+            unreal_total=0.0; total_open_dv01=0.0; age_weighted_sum=0.0
+            for k, q_signed in inv.items():
+                if ABS(q_signed) < EPS: continue
+                if self._marks is not None:
+                    mark = self._marks.get((k, d), np.nan)
+                    if np.isnan(mark): continue
+                else:
+                    if k not in last_trade_mark: continue
+                    mark = last_trade_mark[k]
+                avg_cost = cost_sum[k] / q_signed
+                unreal_total += q_signed * (avg_cost - mark)
+                for lot in lots[k]:
+                    amt = ABS(lot.dv01)
+                    if amt < EPS: continue
+                    total_open_dv01 += amt
+                    start = lot.entry_time.astype("datetime64[D]"); end = t_ns.astype("datetime64[D]")
+                    age = int(np.busday_count(start, end)); age_weighted_sum += amt * age
+            delta_unreal = unreal_total - prev_unreal_total; prev_unreal_total = unreal_total
+            avg_open_age = (age_weighted_sum / total_open_dv01) if total_open_dv01>0 else np.nan
+            if realized_hold_parts:
+                w = sum(a for a,_ in realized_hold_parts)
+                avg_hold_realized = sum(a*d for a,d in realized_hold_parts)/w
+            else: avg_hold_realized = np.nan
+
+            balance_sheet_dv01 = float(sum(ABS(v) for v in inv.values()))
+            balance_sheet_size = float(sum(ABS(v) for v in inv_size.values()))
+
+            # running sum of snapshot gross size
+            cum_balance_sheet_abs_size += balance_sheet_size
+
+            eod_mark_spread = self._marks.get((my_isin, d), np.nan) if self._marks is not None else np.nan
+
+            append({
+                "id": ids[i],
+                "datetime": t.to_pydatetime(),
+                "date": d,
+                "isin": my_isin,
+                "sideInt": int(side_int[i]),
+                "size": sz,
+                "dv01": dv,
+                "traded_spread": m,
+                "quote_spread": q,
+                "eod_mark_spread": float(eod_mark_spread) if not (isinstance(eod_mark_spread, float) and np.isnan(eod_mark_spread)) else np.nan,
+                "won": bool(won),
+                "filled_dv01": float(filled) if won else 0.0,
+                "realized_pnl_this_trade": float(realized_now) if won else 0.0,
+                "cumulative_realized_pnl": float(cum_realized),
+                "unrealized_pnl_this_trade": float(delta_unreal),
+                "total_unrealized_pnl": float(unreal_total),
+                "total_cumulative_pnl": float(cum_realized + unreal_total),
+                "balance_sheet_abs_dv01": balance_sheet_dv01,
+                "balance_sheet_abs_size": balance_sheet_size,
+                "cumulative_gross_traded_size": float(cum_gross_traded_size),
+                "cumulative_balance_sheet_abs_size": float(cum_balance_sheet_abs_size),
+                "avg_open_age_busdays": float(avg_open_age) if not np.isnan(avg_open_age) else np.nan,
+                "avg_realized_holding_busdays": float(avg_hold_realized) if not np.isnan(avg_hold_realized) else np.nan,
+                "post_isin_inventory_dv01": float(inv[my_isin]),
+            })
+
+        self._per_trade = pd.DataFrame(rows).sort_values(["datetime","id"]).reset_index(drop=True)
+
+
+
+
+
+
+
+
+
+
+
 # bond_backtester.py (pandas-only)
 # --------------------------------
 # Lightweight, readable corporate bond RFQ back-tester.

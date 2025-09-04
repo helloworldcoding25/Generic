@@ -1,3 +1,68 @@
+# ====== Numba helpers for modular quoting & controls ======
+
+@njit(fastmath=True)
+def _compute_quote(strategy_type: int, p: np.ndarray,
+                   side: int, base_quote: float, traded: float,
+                   prev_inv_dv01: float, prev_inv_size: float) -> float:
+    """
+    Returns the quote to use for this ticket.
+    strategy_type:
+      0 = Identity: return base_quote (fast path for precomputed quotes)
+      1 = InventorySkew: quote = traded + edge(side) + slope * prev_inv_dv01 (clipped)
+    p: parameter vector (fixed small length). Semantics depend on strategy_type.
+       For type 0: ignored
+       For type 1: p[0]=edge_buy_bp, p[1]=edge_sell_bp, p[2]=inv_slope_bp_per_dv01,
+                   p[3]=clip_min_bp, p[4]=clip_max_bp
+    """
+    if strategy_type == 0:
+        # Identity strategy: use the precomputed base_quote as-is.
+        return base_quote
+
+    elif strategy_type == 1:
+        # InventorySkew: widen/narrow spread as a linear function of inventory.
+        edge = p[0] if side == 1 else p[1]   # side-dependent edge in bp
+        slope = p[2]                          # bp per dv01
+        adj = edge + slope * prev_inv_dv01    # shift around traded
+        # clip adj to avoid extreme quotes
+        if adj < p[3]:
+            adj = p[3]
+        elif adj > p[4]:
+            adj = p[4]
+        return traded + adj
+
+    # Unknown strategy -> fallback to base_quote
+    return base_quote
+
+
+@njit(fastmath=True)
+def _should_gate(gc_flags: int,
+                 cap_size: float,           # portfolio gross size cap
+                 daily_cap_size: float,     # daily gross traded size cap
+                 risk_increasing_delta_bs: float,
+                 projected_global_bs_size: float,
+                 day_traded_so_far: float,
+                 would_trade_gross_size: float) -> bool:
+    """
+    Returns True if any global control should block quoting/winning this trade.
+    gc_flags bitmask:
+      bit 0 (1): enforce portfolio cap by SIZE
+      bit 1 (2): enforce daily gross traded SIZE cap
+    """
+    gate = False
+
+    # Cap by SIZE: only block if this is risk-increasing and would breach cap
+    if (gc_flags & 1) != 0:
+        if (risk_increasing_delta_bs > 0.0) and (projected_global_bs_size > cap_size):
+            gate = True
+
+    # Daily traded cap by SIZE: block if today's gross traded would exceed the cap
+    if (gc_flags & 2) != 0:
+        if (day_traded_so_far + would_trade_gross_size) > daily_cap_size:
+            gate = True
+
+    return gate
+
+
 Step 1 — Add the Python-side strategy classes
 
 File: bond_backtester_ultra.py

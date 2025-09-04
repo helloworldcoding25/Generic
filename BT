@@ -1,3 +1,296 @@
+Step 1 — Add the Python-side strategy classes
+
+File: bond_backtester_ultra.py
+Place near the other top-level classes
+
+# ====== Modular Quote Strategy (Python side, compiles to spec for Numba) ======
+
+class QuoteStrategy:
+    """Base class: convert Python config into a tiny (type, params) spec the kernel can use."""
+    def to_spec(self) -> tuple[int, np.ndarray]:
+        # Default: identity (use the provided per-row base quote)
+        return 0, np.zeros(8, dtype=np.float64)  # 8 slots reserved for params
+
+
+class IdentityQuote(QuoteStrategy):
+    """Use the precomputed base quote vector as-is (fastest path)."""
+    def to_spec(self) -> tuple[int, np.ndarray]:
+        return 0, np.zeros(8, dtype=np.float64)
+
+
+class InventorySkewQuote(QuoteStrategy):
+    """
+    Quote = traded + edge(side) + slope * prev_inv_dv01, clipped.
+    - edge_buy_bp: bp offset when side==+1 (buy)
+    - edge_sell_bp: bp offset when side==-1 (sell)
+    - inv_slope_bp_per_dv01: bp added per unit of signed dv01 inventory
+    - clip_min_bp, clip_max_bp: clip total adjustment
+    """
+    def __init__(self, edge_buy_bp: float = -0.6, edge_sell_bp: float = +0.6,
+                 inv_slope_bp_per_dv01: float = 0.0,
+                 clip_min_bp: float = -10.0, clip_max_bp: float = +10.0):
+        self.edge_buy_bp = float(edge_buy_bp)
+        self.edge_sell_bp = float(edge_sell_bp)
+        self.inv_slope_bp_per_dv01 = float(inv_slope_bp_per_dv01)
+        self.clip_min_bp = float(clip_min_bp)
+        self.clip_max_bp = float(clip_max_bp)
+
+    def to_spec(self) -> tuple[int, np.ndarray]:
+        p = np.zeros(8, dtype=np.float64)
+        p[0] = self.edge_buy_bp
+        p[1] = self.edge_sell_bp
+        p[2] = self.inv_slope_bp_per_dv01
+        p[3] = self.clip_min_bp
+        p[4] = self.clip_max_bp
+        return 1, p
+
+Intuition: users can subclass QuoteStrategy and implement to_spec() returning a strategy_type and a tiny parameter vector. The Numba kernel switches on strategy_type and stays fast.
+
+⸻
+
+Step 2 — Add the Python-side global controls class
+
+File: bond_backtester_ultra.py
+Place near config classes
+
+# ====== Modular Global Controls (Python side) ======
+
+class GlobalControls:
+    """
+    Bundle all gating controls in one place. Convert settings into (flags, params) for Numba.
+    Controls:
+      - portfolio gross SIZE cap (bit 0)
+      - daily gross traded SIZE cap (bit 1)
+    """
+    def __init__(self,
+                 cap_size: float = 1.0e20,
+                 daily_traded_cap_size: float = 1.0e20,
+                 enable_cap: bool = True,
+                 enable_daily_cap: bool = False):
+        self.cap_size = float(cap_size)
+        self.daily_traded_cap_size = float(daily_traded_cap_size)
+        self.enable_cap = bool(enable_cap)
+        self.enable_daily_cap = bool(enable_daily_cap)
+
+    def to_spec(self) -> tuple[int, np.ndarray]:
+        flags = 0
+        if self.enable_cap:
+            flags |= 1
+        if self.enable_daily_cap:
+            flags |= 2
+        p = np.zeros(4, dtype=np.float64)
+        p[0] = self.cap_size
+        p[1] = self.daily_traded_cap_size
+        return flags, p
+
+
+⸻
+
+Step 3 — Wire the new classes into the backtester
+
+File: bond_backtester_ultra.py
+Find the UltraFastBacktester.__init__ and add two optional args:
+
+class UltraFastBacktester:
+    def __init__(
+        self,
+        trades: pd.DataFrame,
+        quote_col: Optional[str] = None,
+        quote_func: Optional[Callable[[Dict[str, object]], float]] = None,
+        eod_marks_df: Optional[pd.DataFrame] = None,
+        cap_size: float = 1.0e20,
+        same_day_win_adjust_bp: float = 0.0,
+        daily_traded_cap_size: float = 200_000_000.0,   # keep your previous default if you use it
+        quote_strategy: Optional[QuoteStrategy] = None, # NEW
+        global_controls: Optional[GlobalControls] = None, # NEW
+    ):
+        ...
+        # Existing config (kept)
+        self.cfg = UltraConfig(cap_size=cap_size, same_day_win_adjust_bp=same_day_win_adjust_bp)
+        self._per_trade = None
+
+        # NEW: store strategies (fall back to defaults)
+        self.quote_strategy = quote_strategy or IdentityQuote()
+        # If you previously enforced daily cap in cfg, mirror it here:
+        default_gc = GlobalControls(cap_size=cap_size,
+                                    daily_traded_cap_size=daily_traded_cap_size,
+                                    enable_cap=True,
+                                    enable_daily_cap=True)
+        self.global_controls = global_controls or default_gc
+
+
+⸻
+
+Step 4 — Prepare strategy/control specs in run()
+
+In UltraFastBacktester.run(...), mode == "global" (right before the kernel call), add:
+
+# Build quote strategy spec (type + params vector)
+qs_type, qs_params = self.quote_strategy.to_spec()
+qs_params = np.asarray(qs_params, dtype=np.float64)
+if qs_params.shape[0] < 8:  # ensure fixed small length for Numba
+    pad = np.zeros(8, dtype=np.float64)
+    pad[:qs_params.shape[0]] = qs_params
+    qs_params = pad
+
+# Build global controls spec (flags + params)
+gc_flags, gc_params = self.global_controls.to_spec()
+gc_params = np.asarray(gc_params, dtype=np.float64)
+if gc_params.shape[0] < 4:
+    pad2 = np.zeros(4, dtype=np.float64)
+    pad2[:gc_params.shape[0]] = gc_params
+    gc_params = pad2
+
+
+⸻
+
+Step 5 — Update the kernel signature and call
+
+Change the signature of process_global_chrono to accept the specs (just add these 4 things after same_day_adjust_bp):
+qs_type, qs_params, gc_flags, gc_params
+
+@njit(fastmath=True)
+def process_global_chrono(
+    isin_code, side, dv01, size, traded, quote_base, bdi, eod_mark,
+    offsets, lengths,
+    lot_dv, lot_sz, lot_sp, lot_bi, head, tail,
+    cap_size, same_day_adjust_bp,
+    qs_type, qs_params,             # NEW
+    gc_flags, gc_params,            # NEW
+    won, filled_dv01, realized_now, cum_realized,
+    unrl_delta, unrl_total, total_cum_pnl,
+    bs_dv01, bs_size, bs_size_long, bs_size_short,
+    cum_gross_size,
+    avg_open_age, realized_hold_avg, post_inv_dv01,
+    quote_after_rules, gated_by_cap
+):
+    ...
+
+Update the call correspondingly (pass the four new args in the same order):
+
+process_global_chrono(
+    isin_codes, side, dv01, size, traded, quotes, bdi, self.marks,
+    offsets, counts,
+    lot_dv, lot_sz, lot_sp, lot_bi, head, tail,
+    float(self.cfg.cap_size), float(self.cfg.same_day_win_adjust_bp),
+    int(qs_type), qs_params,                 # NEW
+    int(gc_flags), gc_params,                # NEW
+    won, filled_dv01, realized_now, cum_real,
+    unrl_delta, unrl_total, total_cum_pnl,
+    bs_dv01, bs_size, bs_size_long, bs_size_short,
+    cum_gross_size,
+    avg_open_age, realized_hold_avg, post_isin_dv01,
+    quote_after_rules, gated_by_cap
+)
+
+Note: if you already removed cum_bs_size and added bs_size_long/short per previous change, keep that order.
+
+⸻
+
+Step 6 — Compute quotes via strategy in the kernel
+
+Inside process_global_chrono, replace the old “get q” lines:
+
+Find:
+
+q0 = quote_base[i]
+q = q0
+# if last_win_bdi[k] == bdi[i] ... same_day_adjust
+
+Replace with:
+
+# Capture prev inventory for quoting logic (state at time of quote)
+prev_inv = inv[k]
+prev_inv_sz = inv_sz[k]
+
+# Strategy-driven quote (fast Numba helper; uses prev inventory if needed)
+q = _compute_quote(qs_type, qs_params, side[i], quote_base[i], traded[i],
+                   prev_inv, prev_inv_sz)
+
+# Optional same-day prior win widening (kept as a separate rule)
+if last_win_bdi[k] == bdi[i] and same_day_adjust_bp != 0.0:
+    q = q + side[i] * same_day_adjust_bp
+
+(We moved prev_inv capture before quoting so the quote sees current state.)
+
+⸻
+
+Step 7 — Gate via GlobalControls in the kernel
+
+Replace your old gating block with the modular one:
+
+Find (old style):
+
+delta_bs_if_fill = abs(inv_sz[k] + sgn * size[i]) - abs(inv_sz[k])
+gate = False
+if delta_bs_if_fill > 0.0 and (global_bs_size + delta_bs_if_fill) > cap_size:
+    gate = True
+m = traded[i]
+w = False if gate else ((q < m) if is_buy else (q > m))
+
+Replace with:
+
+# Risk-increasing change in gross SIZE if we were to win
+delta_bs_if_fill = abs(prev_inv_sz + sgn * size[i]) - abs(prev_inv_sz)
+
+# --- daily tracker (same logic you already have) ---
+# Reset day accumulator when date changes
+# (Place these two lines at loop top if not already there)
+# if bdi[i] != curr_day_bdi:
+#     curr_day_bdi = bdi[i]
+#     day_traded_so_far = 0.0
+
+would_trade_gross = abs(size[i])
+projected_global_bs_size = global_bs_size + delta_bs_if_fill
+
+gate = _should_gate(gc_flags,
+                    gc_params[0],        # cap_size
+                    gc_params[1],        # daily_traded_cap_size
+                    delta_bs_if_fill,
+                    projected_global_bs_size,
+                    day_traded_so_far,
+                    would_trade_gross)
+
+m = traded[i]
+w = False if gate else ((q < m) if is_buy else (q > m))
+
+Keep your daily tracker (curr_day_bdi, day_traded_so_far) as earlier: reset when bdi changes; after a win, increment day_traded_so_far += fill_sz.
+
+⸻
+
+Step 8 — (comment-only) Increment daily counter on wins
+
+Ensure you still have (right after computing fill_sz):
+
+if fill_sz > 0.0:
+    cum_gross += fill_sz
+    day_traded_so_far += fill_sz  # daily cap uses this
+
+
+⸻
+
+Step 9 — (optional) Add a ready-to-use inventory-skew strategy instance
+
+If you want to use the new quoting right away, pass it at construction:
+
+qs = InventorySkewQuote(edge_buy_bp=-0.6, edge_sell_bp=+0.6,
+                        inv_slope_bp_per_dv01=0.05,  # widen 0.05bp per dv01 you’re long
+                        clip_min_bp=-10, clip_max_bp=+10)
+gc = GlobalControls(cap_size=5e8, daily_traded_cap_size=2e8,
+                    enable_cap=True, enable_daily_cap=True)
+
+bt = UltraFastBacktester(df,
+    quote_col="quote_spread",         # still used as base_quote when strategy_type==0
+    eod_marks_df=eod_df,
+    same_day_win_adjust_bp=0.5,
+    quote_strategy=qs,                # NEW
+    global_controls=gc                # NEW
+)
+
+
+⸻
+
+
 
 """
 bond_backtester_ultra.py  — ultra-fast pandas-only backtester with Numba, FIFO, and cross-ISIN rules.

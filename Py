@@ -1,3 +1,284 @@
+Absolutely — you can make the quoting logic fully self-contained in a Numba jitclass so it carries all the data (like per-row alpha) and methods it needs, and the global kernel calls qs.compute(...) directly inside the JIT loop. That keeps it fast and lets others implement their own strategies the same way.
+
+Below I’ll:
+	1.	explain the approach intuitively + a tiny toy example, and
+	2.	give paste-in patches with lots of comments.
+
+⸻
+
+Intuition (and a toy example)
+
+Why a jitclass?
+	•	Numba’s nopython loops can’t call normal Python objects, but they can call methods on Numba jitclass instances.
+	•	So we put all quoting data + logic into a jitclass (e.g., it holds the alpha vector and the parameters).
+	•	The kernel receives one object qs and calls qs.compute(i, side, traded, base_quote, inv_dv01, inv_size) to get the quote for row i.
+
+Your requested logic
+	•	Alpha (0–1): 1 = strong buy; 0 = strong sell.
+Map this to a bp adjustment around traded:
+	•	If alpha=1 and the ticket is a buy, we skew down (more aggressive buys).
+	•	If alpha=1 and the ticket is a sell, we skew up (less aggressive sells).
+	•	Vice versa for alpha=0.
+	•	Inventory skew to 0:
+	•	If a trade would reduce inventory (toward 0), we skew to make that win more likely.
+	•	If a trade would increase inventory (away from 0), we skew to make that win less likely.
+
+Toy example
+	•	You’re long +50 dv01 in a bond.
+	•	A sell ticket arrives (side = −1). Selling reduces this long. We push the quote up a bit to make the sale easier to win.
+	•	Alpha happens to be 0.8 (buyish). That tries to make sells a bit harder (lower the quote), but the inventory-reduction push may outweigh it depending on parameters. The final quote is the sum of the alpha skew + inventory skew, clipped to a safe range.
+
+⸻
+
+Paste-in patches (global mode)
+
+0) Add imports for jitclass at the top of bond_backtester_ultra.py
+
+Place near your other imports:
+
+from numba.experimental import jitclass
+from numba import float64
+
+
+⸻
+
+1) Add the jitclass strategies
+
+Place these above process_global_chrono(...) (e.g., near other Numba helpers).
+
+# ==========================
+# Quote strategies as jitclass
+# ==========================
+
+# A tiny epsilon already present in your module is fine; otherwise define:
+# EPS = 1e-12
+
+# 1) Identity quote: just use the provided base quote (keeps old behavior fast)
+identity_spec = []  # no fields
+
+@jitclass(identity_spec)
+class IdentityQuoteJIT:
+    def compute(self, i, side, traded, base_quote, prev_inv_dv01, prev_inv_size):
+        """
+        Return the quote as-is (base_quote), ignoring traded and inventory.
+        Arguments are kept to match the interface other strategies will use.
+        """
+        return base_quote
+
+
+# 2) Alpha + Inventory-to-zero quote:
+#    Holds per-row alpha plus parameters for alpha amplitude and inventory slope,
+#    and clips the final adjustment to a safe range.
+alpha_inv_spec = [
+    ('alpha', float64[:]),          # per-row alpha (0..1), length == nrows
+    ('alpha_amp_bp', float64),      # max amplitude for alpha term (bp)
+    ('inv_slope_bp_per_dv01', float64),  # bp per dv01 for inventory term
+    ('clip_min_bp', float64),       # min total adjustment (bp)
+    ('clip_max_bp', float64),       # max total adjustment (bp)
+]
+
+@jitclass(alpha_inv_spec)
+class AlphaInventoryQuoteJIT:
+    def __init__(self, alpha, alpha_amp_bp, inv_slope_bp_per_dv01, clip_min_bp, clip_max_bp):
+        self.alpha = alpha
+        self.alpha_amp_bp = alpha_amp_bp
+        self.inv_slope_bp_per_dv01 = inv_slope_bp_per_dv01
+        self.clip_min_bp = clip_min_bp
+        self.clip_max_bp = clip_max_bp
+
+    def compute(self, i, side, traded, base_quote, prev_inv_dv01, prev_inv_size):
+        """
+        side: +1 for buy, -1 for sell (dealer perspective)
+        traded: the traded spread level (we skew around this)
+        base_quote: provided base quote (kept for interface symmetry; not used here)
+        prev_inv_dv01: signed dv01 inventory BEFORE this ticket
+        prev_inv_size: signed size inventory BEFORE this ticket (not used here)
+        """
+        # --- Alpha term ---
+        # Center alpha in [-0.5, +0.5]; positive means buyish.
+        a = self.alpha[i]
+        if a != a:  # NaN check without importing math
+            a = 0.5
+        alpha_c = a - 0.5
+        # For buys (side=+1) positive alpha should LOWER the quote (more aggressive),
+        # for sells (side=-1) positive alpha should RAISE the quote (less aggressive).
+        # That is achieved by: alpha_term = -side * alpha_c * (2*amp)
+        alpha_term = -side * alpha_c * (2.0 * self.alpha_amp_bp)
+
+        # --- Inventory term ---
+        # Encourage risk-REDUCING trades, discourage risk-INCREASING ones.
+        # A trade reduces risk when inv * side < 0 (e.g., long inventory and a sell ticket).
+        risk_reducing = (prev_inv_dv01 * side) < 0.0
+        # "Help sign": for buys, helping a win is negative bp; for sells, helping a win is positive bp.
+        help_sign = -side  # -> -1 for buy, +1 for sell
+        sign_factor = help_sign if risk_reducing else -help_sign
+        inv_term = sign_factor * abs(prev_inv_dv01) * self.inv_slope_bp_per_dv01
+
+        # Total adjustment and clip
+        adj = alpha_term + inv_term
+        if adj < self.clip_min_bp:
+            adj = self.clip_min_bp
+        elif adj > self.clip_max_bp:
+            adj = self.clip_max_bp
+
+        # Quote around traded. (You could choose base_quote instead if you prefer.)
+        return traded + adj
+
+
+# ---------- Python-side helpers to build jitclass instances ----------
+
+def make_identity_quote_jit():
+    """Factory to build an IdentityQuoteJIT instance."""
+    return IdentityQuoteJIT()
+
+def make_alpha_inventory_quote_jit(alpha_vec: np.ndarray,
+                                   alpha_amp_bp: float = 1.0,
+                                   inv_slope_bp_per_dv01: float = 0.05,
+                                   clip_min_bp: float = -25.0,
+                                   clip_max_bp: float = +25.0):
+    """
+    alpha_vec: numpy array (length nrows) of alpha in [0,1] per ticket
+    Returns a JIT-compiled strategy instance usable inside the Numba kernel.
+    """
+    alpha_arr = np.asarray(alpha_vec, dtype=np.float64)
+    return AlphaInventoryQuoteJIT(alpha_arr, float(alpha_amp_bp),
+                                  float(inv_slope_bp_per_dv01),
+                                  float(clip_min_bp), float(clip_max_bp))
+
+What changed (intuitive):
+We created two Numba classes. The second one stores the alpha vector and parameters and exposes a .compute(...) method that returns the skewed quote. No Python is called inside the kernel — it’s all JIT’d.
+
+⸻
+
+2) Backtester: accept a quote_strategy_jit and pass it to the kernel
+
+In UltraFastBacktester.__init__, add one optional arg and keep a reference:
+
+class UltraFastBacktester:
+    def __init__(
+        self,
+        trades: pd.DataFrame,
+        quote_col: Optional[str] = None,
+        quote_func: Optional[Callable[[Dict[str, object]], float]] = None,
+        eod_marks_df: Optional[pd.DataFrame] = None,
+        cap_size: float = 1.0e20,
+        same_day_win_adjust_bp: float = 0.0,
+        # ... keep any other args you have ...
+        quote_strategy_jit=None,   # <-- NEW: pass a jitclass instance here
+    ):
+        self.df = _normalize_trades(trades)
+        ...
+        self.quote_col = quote_col
+        self.quote_func = quote_func
+        self.marks = _prepare_eod_mark_vector(self.df, eod_marks_df)
+        self.cfg = UltraConfig(cap_size=cap_size, same_day_win_adjust_bp=same_day_win_adjust_bp)
+        self._per_trade = None
+
+        # NEW: store the jitclass strategy (or default to identity)
+        self.quote_strategy_jit = quote_strategy_jit  # may be None; we’ll default in run()
+
+In run(...), mode=="global" right before calling the kernel, ensure we have a jitclass:
+
+# Build / default the jitclass quote strategy
+qs = self.quote_strategy_jit
+if qs is None:
+    qs = make_identity_quote_jit()  # fast no-op strategy
+
+
+⸻
+
+3) Kernel signature: add the strategy object, compute quotes via it
+
+Change the signature of process_global_chrono(...) to accept qs (place it after same_day_adjust_bp and before outputs). Example:
+
+@njit(fastmath=True)
+def process_global_chrono(
+    isin_code, side, dv01, size, traded, quote_base, bdi, eod_mark,
+    offsets, lengths,
+    lot_dv, lot_sz, lot_sp, lot_bi, head, tail,
+    cap_size, same_day_adjust_bp,
+    qs,  # <-- NEW: the jitclass quote strategy instance
+    won, filled_dv01, realized_now, cum_realized,
+    unrl_delta, unrl_total, total_cum_pnl,
+    bs_dv01, bs_size, bs_size_long, bs_size_short,
+    cum_gross_size,
+    avg_open_age, realized_hold_avg, post_inv_dv01,
+    quote_after_rules, gated_by_cap
+):
+    ...
+
+Update the call accordingly (add qs in the same position):
+
+process_global_chrono(
+    isin_codes, side, dv01, size, traded, quotes, bdi, self.marks,
+    offsets, counts,
+    lot_dv, lot_sz, lot_sp, lot_bi, head, tail,
+    float(self.cfg.cap_size), float(self.cfg.same_day_win_adjust_bp),
+    qs,   # <-- NEW
+    won, filled_dv01, realized_now, cum_real,
+    unrl_delta, unrl_total, total_cum_pnl,
+    bs_dv01, bs_size, bs_size_long, bs_size_short,
+    cum_gross_size,
+    avg_open_age, realized_hold_avg, post_isin_dv01,
+    quote_after_rules, gated_by_cap
+)
+
+
+⸻
+
+4) Inside the kernel: replace quote computation with qs.compute(...)
+
+Find your current quote logic (e.g., q = quote_base[i] and any strategy spec), and replace it with this block (well-commented):
+
+        # --- QUOTING: call the strategy jitclass with ONLY state available NOW ---
+        # Capture per-ISIN state *before* deciding the quote so strat sees live inventory
+        prev_inv = inv[k]
+        prev_inv_sz = inv_sz[k]
+
+        # Strategy computes the quote. It may ignore base_quote or traded as it wishes.
+        q = qs.compute(i, side[i], traded[i], quote_base[i], prev_inv, prev_inv_sz)
+
+        # Optional same-day prior-win widening (keep your rule)
+        if last_win_bdi[k] == bdi[i] and same_day_adjust_bp != 0.0:
+            q = q + side[i] * same_day_adjust_bp
+
+That’s it — the strategy is now a self-contained class used directly in the JIT loop.
+
+⸻
+
+Usage example
+
+# alpha is a pandas Series aligned to df rows (0..1)
+alpha = my_alpha_series.reindex(df.index).to_numpy(np.float64)
+
+# Build the JIT strategy (fully self-contained)
+qs = make_alpha_inventory_quote_jit(
+    alpha_vec=alpha,
+    alpha_amp_bp=1.5,                 # max alpha push in bp
+    inv_slope_bp_per_dv01=0.03,       # inventory push per dv01
+    clip_min_bp=-15.0, clip_max_bp=15.0
+)
+
+bt = UltraFastBacktester(
+    df,
+    quote_col="quote_spread",         # still passed; strategy may ignore or use it
+    eod_marks_df=eod_df,
+    same_day_win_adjust_bp=0.5,
+    quote_strategy_jit=qs             # <-- strategy instance passed in
+)
+bt.run(mode="global")
+per_trade = bt.per_trade
+
+
+⸻
+
+Why this satisfies your goals
+	•	Self-contained: The quoting class carries all data it needs (alpha vector + params) and the method implements all logic (compute).
+	•	Fast: It’s a Numba jitclass, so method calls are compiled and safe inside @njit loops.
+	•	Extensible: Others can copy the pattern, define their own @jitclass with any fields (e.g., per-row features, per-ISIN settings), as long as they expose the same compute(...) signature. No changes to the kernel structure are required.
+
+If you want, I can add a registry to allow multiple strategies at once (e.g., per-ISIN strategy selection) or an ISIN-specific parameter vector baked into the jitclass.
+
 # ====== Numba helpers for modular quoting & controls ======
 
 @njit(fastmath=True)
